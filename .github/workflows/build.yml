@@ -1,0 +1,157 @@
+name: Build patched Audiobookshelf app
+
+# Follows upstream advplyr/audiobookshelf-app releases: for each new tag, apply
+# patches/*.patch on top of that tag, build a release APK, sign it with this
+# repository's keystore, and publish it as a GitHub release that Obtainium can
+# track. Nothing of upstream's code lives on this repository's branches, so
+# upstream's own workflows never run here.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"          # once a day: is there a new upstream release?
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (blank = latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this version was already released"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ["patches/**", "PATCH_REV", ".github/workflows/build.yml"]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: advplyr/audiobookshelf-app
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Keep the schedule alive
+        # GitHub disables scheduled workflows after 60 days without repository
+        # activity; upstream gaps run to ~90 days.
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable" || true
+
+      - name: Resolve the upstream tag and our version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.upstream_tag }}"
+          if [ -z "$TAG" ]; then
+            # every upstream release is a prerelease, so /releases/latest is useless
+            TAG=$(gh api "repos/${UPSTREAM}/releases?per_page=10" --jq '[.[] | select(.draft|not)][0].tag_name')
+          fi
+          REV=$(tr -d ' \r\n' < fork/PATCH_REV)
+          VER="${TAG#v}-sd${REV}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event.inputs.force }}" != "true" ] && gh release view "v$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$VER is already released"; echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream at that tag
+        if: steps.ver.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: advplyr/audiobookshelf-app
+          ref: ${{ steps.ver.outputs.tag }}
+          path: src
+          fetch-depth: 0
+
+      - name: Apply the patches
+        if: steps.ver.outputs.skip == 'false'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config user.name "Release Radar"
+          git config user.email "release-radar@users.noreply.github.com"
+          git am -3 ../fork/patches/*.patch
+          sed -i -E "s/versionName \"[^\"]+\"/versionName \"${{ steps.ver.outputs.ver }}\"/" android/app/build.gradle
+          git --no-pager log --oneline -3
+
+      - name: Node
+        if: steps.ver.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - name: Java
+        if: steps.ver.outputs.skip == 'false'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Gradle cache
+        if: steps.ver.outputs.skip == 'false'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build the web app and sync it into the Android project
+        if: steps.ver.outputs.skip == 'false'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          npm ci --omit=optional
+          npm run generate
+          npx cap sync android
+
+      - name: Build the release APK
+        if: steps.ver.outputs.skip == 'false'
+        working-directory: src/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Sign the APK
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64" || { echo "KEYSTORE_B64 secret is missing"; exit 1; }
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          UNSIGNED=src/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" aligned.apk
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/keystore.jks" --ks-pass env:KEYSTORE_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD --out audiobookshelf-series.apk aligned.apk
+          "$BT/apksigner" verify --print-certs audiobookshelf-series.apk
+          sha256sum audiobookshelf-series.apk | tee SHA256SUMS.txt
+          rm -f "$RUNNER_TEMP/keystore.jks"
+
+      - name: Publish the release
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.ver }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          SHA=$(git -C src rev-parse --short HEAD~1)
+          NOTES=$(printf 'Upstream %s %s (%s) + patches at %s.\n\n%s\n\nShows each series description on the series page (Release Radar writes its one-line status there).' \
+                  "$UPSTREAM" "$TAG" "$SHA" "${GITHUB_SHA::7}" "$(cat SHA256SUMS.txt)")
+          if gh release view "v$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$VER" audiobookshelf-series.apk SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "v$VER" audiobookshelf-series.apk SHA256SUMS.txt --target main --title "v$VER" --latest --notes "$NOTES" -R "$GITHUB_REPOSITORY"
+          fi

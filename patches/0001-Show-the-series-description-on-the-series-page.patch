@@ -1,0 +1,42 @@
+From 6e89d2978da814a7ab84c7e3cf306735b2958431 Mon Sep 17 00:00:00 2001
+From: Release Radar <release-radar@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:05:06 +0800
+Subject: [PATCH] Show the series description on the series page
+
+Audiobookshelf stores a per-series description (PATCH /api/series/:id) that
+no client displays. Render it as one small line above the shelf on the
+series page, with a Material Symbols icon, hidden when empty. The scroll
+handler accounts for the content above the shelf.
+
+diff --git a/components/bookshelf/LazyBookshelf.vue b/components/bookshelf/LazyBookshelf.vue
+index df6782d..ed48a70 100644
+--- a/components/bookshelf/LazyBookshelf.vue
++++ b/components/bookshelf/LazyBookshelf.vue
+@@ -233,6 +233,7 @@ export default {
+       }
+     },
+     handleScroll(scrollTop) {
++      scrollTop = Math.max(0, scrollTop - (this.$el.offsetTop || 0)) // content above #bookshelf (the series description line)
+       this.currScrollTop = scrollTop
+       var firstShelfIndex = Math.floor(scrollTop / this.shelfHeight)
+       var lastShelfIndex = Math.ceil((scrollTop + this.bookshelfHeight) / this.shelfHeight)
+diff --git a/pages/bookshelf/series/_id.vue b/pages/bookshelf/series/_id.vue
+index 43f3507..e5faa64 100644
+--- a/pages/bookshelf/series/_id.vue
++++ b/pages/bookshelf/series/_id.vue
+@@ -1,5 +1,14 @@
+ <template>
+-  <bookshelf-lazy-bookshelf page="series-books" :series-id="seriesId" v-on:downloadSeriesClick="downloadSeriesClick" />
++  <div class="w-full h-full">
++    <!-- Release Radar: the series description (set through the API) as one small line above the shelf -->
++    <div v-if="series && series.description" class="px-4 pt-2.5 pb-1">
++      <span class="inline-flex items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-2.5 py-0.5 text-xs text-fg-muted">
++        <span class="material-symbols text-base" style="line-height: 1">{{ /overdue|est\./.test(series.description) ? 'schedule' : 'event' }}</span>
++        <span class="truncate">{{ series.description }}</span>
++      </span>
++    </div>
++    <bookshelf-lazy-bookshelf page="series-books" :series-id="seriesId" v-on:downloadSeriesClick="downloadSeriesClick" />
++  </div>
+ </template>
+ 
+ <script>
