@@ -1,0 +1,320 @@
+From 7a3365d814b1e3fe1bd06f61c35f40891e814d50 Mon Sep 17 00:00:00 2001
+From: Release Radar <release-radar@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 15:05:51 +0800
+Subject: [PATCH 2/2] Faster streaming over a tunnel; listening sessions in the
+ player
+
+- ExoPlayer keeps 60s of audio behind the playhead (back buffer) so the
+  auto-rewind after a pause plays from memory instead of a new request;
+  60s/300s forward buffer, 5s rebuffer threshold (was 20s)
+- one shared OkHttp client with an IPv4-first resolver for API calls, the
+  ping client and the player's streaming data source (OkHttp 4.9 tries
+  addresses sequentially, so a VPN with non-routing IPv6 stalled every connect)
+- a VPN counts as a network in the connectivity check (upstream #1702)
+- socket.io reconnects sooner (5s max delay, 10s attempt timeout)
+- Listening sessions for the current book from the player menu: the server's
+  sessions for this item, grouped by day, tap to continue from where one ended
+
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index f2a7037..6f95bd8 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -112,6 +112,7 @@ dependencies {
+     implementation "com.google.android.exoplayer:extension-mediasession:$exoplayer_version"
+     implementation "com.google.android.exoplayer:extension-cast:$exoplayer_version"
+     implementation "com.google.android.exoplayer:exoplayer-hls:$exoplayer_version"
++    implementation "com.google.android.exoplayer:extension-okhttp:$exoplayer_version" // Release Radar fork
+   }
+ 
+   // Glide for images
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt b/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt
+index de931ca..cf77302 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt
+@@ -166,6 +166,10 @@ object DeviceManager {
+       } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+         Log.i("Internet", "NetworkCapabilities.TRANSPORT_ETHERNET")
+         return true
++      } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
++        // Release Radar fork (upstream #1702): a VPN counts as a network too
++        Log.i("Internet", "NetworkCapabilities.TRANSPORT_VPN")
++        return true
+       }
+     }
+     return false
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+index 86d4bdc..e23871e 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+@@ -48,6 +48,8 @@ import com.google.android.exoplayer2.ext.mediasession.TimelineQueueNavigator
+ import com.google.android.exoplayer2.extractor.DefaultExtractorsFactory
+ import com.google.android.exoplayer2.extractor.mp3.Mp3Extractor
+ import com.google.android.exoplayer2.source.MediaSource
++import com.google.android.exoplayer2.ext.okhttp.OkHttpDataSource
++import com.audiobookshelf.app.server.AbsHttp
+ import com.google.android.exoplayer2.source.ProgressiveMediaSource
+ import com.google.android.exoplayer2.source.hls.HlsMediaSource
+ import com.google.android.exoplayer2.ui.PlayerNotificationManager
+@@ -389,11 +391,15 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     val customLoadControl: LoadControl =
+             DefaultLoadControl.Builder()
+                     .setBufferDurationsMs(
+-                            1000 * 20, // 20s min buffer
+-                            1000 * 45, // 45s max buffer
++                            1000 * 60, // 60s min buffer: keep well ahead on a slow tunnel
++                            1000 * 300, // 300s max buffer (~5 MB at 128 kbps)
+                             1000 * 5, // 5s playback start
+-                            1000 * 20 // 20s playback rebuffer
++                            1000 * 5 // 5s playback rebuffer (was 20s: a stall waited for 20s of audio)
+                     )
++                    // Release Radar fork: keep 60s of audio BEHIND the playhead so the auto-rewind
++                    // after a pause (up to 29.5s) is served from memory instead of a new request
++                    // through the tunnel (the "no buffer" resume)
++                    .setBackBuffer(1000 * 60, true)
+                     .build()
+ 
+     mPlayer =
+@@ -513,7 +519,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+                         .createMediaSource(mediaItems[0])
+       } else if (!playbackSession.isHLS) {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Direct playing item ${currentPlaybackSession?.mediaItemId}.")
+-        val dataSourceFactory = DefaultHttpDataSource.Factory()
++        val dataSourceFactory = OkHttpDataSource.Factory(AbsHttp.client) // Release Radar fork: shared pool, IPv4 first
+ 
+         val extractorsFactory = DefaultExtractorsFactory()
+         extractorsFactory.setConstantBitrateSeekingEnabled(true)
+@@ -530,7 +536,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+                         .createMediaSource(mediaItems[0])
+       } else {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Playing HLS stream of item ${currentPlaybackSession?.mediaItemId}.")
+-        val dataSourceFactory = DefaultHttpDataSource.Factory()
++        val dataSourceFactory = OkHttpDataSource.Factory(AbsHttp.client) // Release Radar fork: shared pool, IPv4 first
+         dataSourceFactory.setUserAgent(channelId)
+         dataSourceFactory.setDefaultRequestProperties(
+                 hashMapOf("Authorization" to "Bearer ${DeviceManager.token}")
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt b/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
+index 2ad61a7..2ddf832 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
+@@ -22,6 +22,8 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+ import com.fasterxml.jackson.module.kotlin.readValue
+ import com.getcapacitor.JSArray
+ import com.getcapacitor.JSObject
++import java.net.Inet4Address
++import java.net.InetAddress
+ import okhttp3.*
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.RequestBody.Companion.toRequestBody
+@@ -32,6 +34,24 @@ import org.json.JSONObject
+ import java.io.IOException
+ import java.util.concurrent.TimeUnit
+ 
++/**
++ * Release Radar fork: ONE OkHttp client for the whole app (API calls, the ping
++ * client and ExoPlayer's streaming data source share its connection pool), with
++ * a resolver that tries IPv4 addresses before IPv6. OkHttp 4.9 tries addresses
++ * one after another with a full connect timeout each, so a VPN that hands out
++ * IPv6 which does not actually route made every connection wait for that
++ * timeout before falling back ("takes forever to connect on the VPN").
++ */
++object AbsHttp {
++  val dns = object : Dns {
++    override fun lookup(hostname: String): List<InetAddress> {
++      val all = Dns.SYSTEM.lookup(hostname)
++      return all.filter { it is Inet4Address } + all.filter { it !is Inet4Address }
++    }
++  }
++  val client: OkHttpClient = OkHttpClient.Builder().dns(dns).build()
++}
++
+ class ApiHandler(var ctx:Context) {
+   val tag = "ApiHandler"
+ 
+@@ -44,8 +64,8 @@ class ApiHandler(var ctx:Context) {
+     }
+   }
+ 
+-  private var defaultClient = OkHttpClient()
+-  private var pingClient = OkHttpClient.Builder().callTimeout(3, TimeUnit.SECONDS).build()
++  private var defaultClient = AbsHttp.client
++  private var pingClient = AbsHttp.client.newBuilder().callTimeout(3, TimeUnit.SECONDS).build()
+   private var jacksonMapper = jacksonObjectMapper().enable(JsonReadFeature.ALLOW_UNESCAPED_CONTROL_CHARS.mappedFeature())
+   private var secureStorage = SecureStorage(ctx)
+ 
+diff --git a/components/app/AudioPlayer.vue b/components/app/AudioPlayer.vue
+index c9d2f63..4ecb5df 100644
+--- a/components/app/AudioPlayer.vue
++++ b/components/app/AudioPlayer.vue
+@@ -216,6 +216,14 @@ export default {
+           icon: 'history'
+         })
+       }
++      // Release Radar fork: the server's listening sessions for THIS book
++      if (!this.isPodcast && this.serverLibraryItemId) {
++        items.push({
++          text: 'Listening sessions',
++          value: 'sessions',
++          icon: 'schedule'
++        })
++      }
+ 
+       items.push(
+         ...[
+@@ -769,6 +777,9 @@ export default {
+         if (action === 'history') {
+           this.$router.push(`/media/${this.mediaId}/history?title=${this.title}`)
+           this.showFullscreen = false
++        } else if (action === 'sessions') {
++          this.$router.push(`/media/${this.serverLibraryItemId}/sessions?libraryItemId=${this.serverLibraryItemId}&title=${encodeURIComponent(this.title || '')}`)
++          this.showFullscreen = false
+         } else if (action === 'scale_elapsed_time') {
+           this.playerSettings.scaleElapsedTimeBySpeed = !this.playerSettings.scaleElapsedTimeBySpeed
+           this.updateTimestamp()
+diff --git a/pages/media/_id/sessions.vue b/pages/media/_id/sessions.vue
+new file mode 100644
+index 0000000..6686175
+--- /dev/null
++++ b/pages/media/_id/sessions.vue
+@@ -0,0 +1,128 @@
++<template>
++  <div class="w-full h-full px-3 py-4 overflow-y-auto relative bg-bg">
++    <p class="mb-1 text-lg font-semibold">Listening sessions</p>
++    <p class="mb-4 text-sm text-fg-muted truncate">{{ title }}</p>
++
++    <div v-if="error" class="text-center py-8">
++      <p class="text-fg">{{ error }}</p>
++    </div>
++    <div v-else-if="!sessions.length && !loading" class="text-center py-8">
++      <p class="text-fg">No sessions on the server for this book</p>
++    </div>
++
++    <p v-if="sessions.length" class="mb-2 text-xs text-fg-muted">{{ total }} session{{ total === 1 ? '' : 's' }} · {{ $elapsedPretty(totalListened, true) }} in the ones shown</p>
++
++    <div v-for="(group, day) in groupedSessions" :key="day" class="py-1">
++      <p class="my-2 text-fg-muted font-semibold">{{ day }}</p>
++      <div v-for="s in group" :key="s.id" class="py-3 flex items-center border-b border-white/5" @click="clickSession(s)">
++        <div class="w-24 flex-shrink-0">
++          <p class="text-sm text-fg">{{ $formatDate(s.startedAt, 'HH:mm') }}<span class="text-fg-muted"> – {{ $formatDate(s.updatedAt, 'HH:mm') }}</span></p>
++          <p class="text-xs text-fg-muted">{{ $elapsedPretty(s.timeListening || 0) }}</p>
++        </div>
++        <div class="flex-grow px-2 min-w-0">
++          <p class="text-sm text-fg truncate">{{ deviceLabel(s) }}</p>
++          <p class="text-xs text-fg-muted">{{ $secondsToTimestampFull(s.startTime || 0) }} → {{ $secondsToTimestampFull(s.currentTime || 0) }}</p>
++        </div>
++        <span class="material-symbols text-2xl text-fg-muted flex-shrink-0 px-1">play_arrow</span>
++      </div>
++    </div>
++
++    <div v-if="page + 1 < numPages" class="py-4 flex justify-center">
++      <ui-btn :loading="loading" @click="loadMore">Load more</ui-btn>
++    </div>
++  </div>
++</template>
++
++<script>
++// Release Radar fork: the server's listening sessions for ONE book, from the
++// player's menu. The same data as the web client's Listening Sessions page
++// (GET /api/me/item/listening-sessions/:libraryItemId), grouped by day; a tap
++// continues playback from where that session ended, whichever device it was on.
++export default {
++  async asyncData({ params, query, app }) {
++    const libraryItemId = query.libraryItemId || params.id
++    const title = query.title || 'Unknown'
++    let sessions = []
++    let total = 0
++    let numPages = 0
++    let error = null
++    const payload = await app.$nativeHttp.get(`/api/me/item/listening-sessions/${libraryItemId}?itemsPerPage=40&page=0`).catch((err) => {
++      console.error('Failed to load listening sessions', err)
++      error = 'Could not load the sessions from the server'
++      return null
++    })
++    if (payload) {
++      sessions = payload.sessions || []
++      total = payload.total || sessions.length
++      numPages = payload.numPages || 1
++    }
++    return { libraryItemId, title, sessions, total, numPages, error }
++  },
++  data() {
++    return {
++      page: 0,
++      loading: false
++    }
++  },
++  computed: {
++    playerIsStartingPlayback() {
++      return this.$store.state.playerIsStartingPlayback
++    },
++    totalListened() {
++      return this.sessions.reduce((sum, s) => sum + (s.timeListening || 0), 0)
++    },
++    groupedSessions() {
++      const today = this.$formatDate(new Date(), 'MMM dd, yyyy')
++      const yesterday = this.$formatDate(Date.now() - 1000 * 60 * 60 * 24, 'MMM dd, yyyy')
++      const groups = {}
++      const sorted = [...this.sessions].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
++      sorted.forEach((s) => {
++        const date = this.$formatDate(s.startedAt || s.updatedAt, 'MMM dd, yyyy')
++        const key = date === today ? 'Today' : date === yesterday ? 'Yesterday' : date
++        if (!groups[key]) groups[key] = []
++        groups[key].push(s)
++      })
++      return groups
++    }
++  },
++  methods: {
++    deviceLabel(s) {
++      const d = s.deviceInfo || {}
++      const client = (d.clientName || '').replace(/^Abs\s*/i, '') || 'Unknown client'
++      const device = d.deviceName || [d.manufacturer, d.model].filter(Boolean).join(' ') || d.osName || ''
++      return device ? `${client} · ${device}` : client
++    },
++    async loadMore() {
++      if (this.loading) return
++      this.loading = true
++      const next = this.page + 1
++      const payload = await this.$nativeHttp.get(`/api/me/item/listening-sessions/${this.libraryItemId}?itemsPerPage=40&page=${next}`).catch((err) => {
++        console.error('Failed to load more listening sessions', err)
++        return null
++      })
++      if (payload) {
++        const seen = new Set(this.sessions.map((s) => s.id))
++        this.sessions = this.sessions.concat((payload.sessions || []).filter((s) => !seen.has(s.id)))
++        this.page = next
++        this.numPages = payload.numPages || this.numPages
++      }
++      this.loading = false
++    },
++    async clickSession(s) {
++      if (this.playerIsStartingPlayback) return
++      await this.$hapticsImpact()
++      this.playAtTime(s.currentTime || 0)
++    },
++    playAtTime(startTime) {
++      // the same hand-off the local history page uses: a local copy wins, else stream
++      this.$store.commit('setPlayerIsStartingPlayback', this.libraryItemId)
++      const localProg = this.$store.getters['globals/getLocalMediaProgressByServerItemId'](this.libraryItemId, null)
++      if (localProg) {
++        this.$eventBus.$emit('play-item', { libraryItemId: localProg.localLibraryItemId, episodeId: localProg.localEpisodeId, serverLibraryItemId: this.libraryItemId, serverEpisodeId: null, startTime })
++      } else {
++        this.$eventBus.$emit('play-item', { libraryItemId: this.libraryItemId, episodeId: null, startTime })
++      }
++    }
++  }
++}
++</script>
+diff --git a/plugins/server.js b/plugins/server.js
+index fccc06b..e8725ce 100644
+--- a/plugins/server.js
++++ b/plugins/server.js
+@@ -37,7 +37,8 @@ class ServerSocket extends EventEmitter {
+       transports: ['websocket'],
+       upgrade: false,
+       path: `${serverPath}/socket.io`,
+-      reconnectionDelayMax: 15000
++      reconnectionDelayMax: 5000, // Release Radar fork: was 15000
++      timeout: 10000 // was the 20000 default
+     }
+     this.socket = io(serverHost, socketOptions)
+     this.setSocketListeners()

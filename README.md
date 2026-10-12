@@ -4,7 +4,10 @@ The official [Audiobookshelf Android app](https://github.com/advplyr/audiobooksh
 the series page shows the series' description, which the server stores but no client displays. Release Radar
 writes a one-line status there ("Audio 2 overdue by 10 days", "Audiobook 3 Nov", "Audio 6 est. 13 Feb 2027").
 
-Nothing else is changed. The patch is `patches/0001-*.patch`, twelve lines in two files.
+Patch 2 makes streaming over a tunnel bearable: a 60 s back buffer so the auto-rewind after a pause plays from
+memory, a 5 s rebuffer threshold, one shared HTTP client that tries IPv4 before IPv6 (a VPN with non-routing
+IPv6 used to stall every connection), a VPN counted as a network, and a "Listening sessions" entry in the
+player's menu listing the server's sessions for the current book. The patches are `patches/*.patch`.
 
 ## How it stays current
 
