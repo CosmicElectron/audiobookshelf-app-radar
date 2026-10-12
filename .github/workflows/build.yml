@@ -148,7 +148,7 @@ jobs:
           VER="${{ steps.ver.outputs.ver }}"
           TAG="${{ steps.ver.outputs.tag }}"
           SHA=$(git -C src rev-parse --short HEAD~1)
-          NOTES=$(printf 'Upstream %s %s (%s) + patches at %s.\n\n%s\n\nShows each series description on the series page (Release Radar writes its one-line status there).' \
+          NOTES=$(printf 'Upstream %s %s (%s) + patches at %s.\n\n%s\n\nPatches: series descriptions on the series page (Release Radar writes its one-line status there); smoother streaming over a tunnel (back buffer, IPv4-first, VPN-aware) with listening sessions in the player; a home-network address, used whenever it answers. Details in the README.' \
                   "$UPSTREAM" "$TAG" "$SHA" "${GITHUB_SHA::7}" "$(cat SHA256SUMS.txt)")
           if gh release view "v$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "v$VER" audiobookshelf-series.apk SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
