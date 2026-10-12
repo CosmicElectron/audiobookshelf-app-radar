@@ -1,0 +1,1348 @@
+From 581cbee0ed7b086d84e94f9a20b4e513fe5be013 Mon Sep 17 00:00:00 2001
+From: Release Radar <release-radar@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 18:47:41 +0800
+Subject: [PATCH 4/4] Stream cache, two positions per book, playback
+ diagnostics
+
+Streamed audio now passes through a 768 MB on-disk cache keyed by file (not
+by the per-session URL), so the index at the head of the file and the audio
+around the playhead come from the phone on the next start. The load control
+keeps ten minutes ahead while paused; a pre-buffer (off on metered networks,
+cancellable, with a no-progress watchdog) writes the window around the other
+position of the book, so the way back is instant too. Every track of a
+multi-file book goes through the same factory (cache, home route, retry).
+
+Two positions, the Audible way: the phone records where it left each book;
+when a session starts at the synced position another device moved to, or
+play is pressed after a longer pause and the server is ahead (checked first,
+never waiting more than 2 s), playback continues from the synced position
+and the player menu offers the way back to this phone's position.
+
+Playback diagnostics go to the log page: audio focus and suppression, player
+and device volume (edges only), audio outputs coming and going, sink and
+decoder errors, underruns, a heartbeat every five minutes while playing.
+
+Home-network route: the route is tied to the exact (canonical, home) pair
+it was verified for and every probe re-proves the same server; a cancelled
+request or a non-connect error no longer marks the home address down; a
+held-off probe is deferred, not dropped; the account page saves only the
+address (no stale token written back).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/managers/SleepTimerManager.kt b/android/app/src/main/java/com/audiobookshelf/app/managers/SleepTimerManager.kt
+index ca359ed..8bea08e 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/managers/SleepTimerManager.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/managers/SleepTimerManager.kt
+@@ -65,8 +65,17 @@ constructor(private val playerNotificationService: PlayerNotificationService) {
+    * Sets the volume of the player.
+    * @param volume Float - the volume level to set.
+    */
++  private var fadeLogged = false // Release Radar fork
+   private fun setVolume(volume: Float) {
+     playerNotificationService.currentPlayer.volume = volume
++    // Release Radar fork: one log line when the fade starts and one when the volume is back
++    if (volume < 0.999f && !fadeLogged) {
++      fadeLogged = true
++      AbsLogger.info(tag, "sleep timer: fading the volume down")
++    } else if (volume >= 0.999f && fadeLogged) {
++      fadeLogged = false
++      AbsLogger.info(tag, "sleep timer: volume restored")
++    }
+   }
+ 
+   /** Pauses the player. */
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt b/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt
+index ea5fbdf..dec2e31 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt
+@@ -789,6 +789,8 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+             if (result) {
+               hasValidConn = true
+               DeviceManager.serverConnectionConfig = config
++              com.audiobookshelf.app.server.ServerRoute.markDown("config switch") // Release Radar fork: never reuse a route verified for another pair
++              com.audiobookshelf.app.server.ServerRoute.probe("config switch", force = true)
+               Log.d(tag, "checkSetValidServerConnectionConfig: Set server connection config ${DeviceManager.serverConnectionConfigId}")
+               break
+             }
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt b/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt
+index 1aeed0a..8dfcf66 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt
+@@ -36,6 +36,7 @@ class MediaProgressSyncer(
+   var listeningTimerRunning: Boolean = false
+ 
+   private var lastSyncTime: Long = 0
++  val lastSyncedAt: Long get() = lastSyncTime // Release Radar fork
+   private var failedSyncs: Int = 0
+ 
+   var currentPlaybackSession: PlaybackSession? = null // copy of pb session currently syncing
+@@ -90,6 +91,7 @@ class MediaProgressSyncer(
+                                           METERED_CONNECTION_SYNC_INTERVAL
+ 
+                   val currentTime = playerNotificationService.getCurrentTimeSeconds()
++                  currentPlaybackSession?.let { com.audiobookshelf.app.player.StreamCache.recordPosition(it.libraryItemId, (currentTime * 1000).toLong()) } // Release Radar fork
+                   if (currentTime > 0) {
+                     sync(shouldSyncServer, currentTime) { syncResult ->
+                       Log.d(tag, "Sync complete")
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt
+new file mode 100644
+index 0000000..9ae04a8
+--- /dev/null
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt
+@@ -0,0 +1,233 @@
++package com.audiobookshelf.app.player
++
++import android.content.Context
++import android.media.AudioDeviceCallback
++import android.media.AudioDeviceInfo
++import android.media.AudioManager
++import android.os.Handler
++import android.os.Looper
++import com.audiobookshelf.app.plugins.AbsLogger
++import com.google.android.exoplayer2.ExoPlayer
++import com.google.android.exoplayer2.Format
++import com.google.android.exoplayer2.PlaybackException
++import com.google.android.exoplayer2.Player
++import com.google.android.exoplayer2.analytics.AnalyticsListener
++import com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime
++import com.google.android.exoplayer2.audio.AudioAttributes
++import com.google.android.exoplayer2.decoder.DecoderReuseEvaluation
++import com.google.android.exoplayer2.source.LoadEventInfo
++import com.google.android.exoplayer2.source.MediaLoadData
++import java.io.IOException
++import java.util.Locale
++import java.util.concurrent.Executors
++
++/**
++ * Release Radar fork: what the player is doing, written to the log page
++ * (Settings > Logs), so that a "kept playing but no sound" moment leaves a
++ * trace: audio focus, playback suppression, player and device volume, the
++ * audio output devices coming and going, sink/decoder errors, underruns, and
++ * a heartbeat every few minutes while playing.
++ */
++class PlaybackDiagnostics(ctx: Context, private val player: ExoPlayer) : AnalyticsListener {
++  companion object {
++    private const val tag = "Playback"
++    private const val HEARTBEAT_MS = 5 * 60 * 1000L
++  }
++
++  private val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
++  private val handler = Handler(Looper.getMainLooper())
++  private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "playback-diagnostics").apply { isDaemon = true } }
++  private var lastState = -1
++  private var volumeFull = true
++  private var volumeLoggedAt = 0L
++
++  private val deviceCallback = object : AudioDeviceCallback() {
++    override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) {
++      val sinks = added.filter { it.isSink && interesting(it) }
++      if (sinks.isNotEmpty()) log("audio output added: ${sinks.joinToString { describe(it) }}; ${snapshot()}")
++    }
++    override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) {
++      val sinks = removed.filter { it.isSink && interesting(it) }
++      if (sinks.isNotEmpty()) log("audio output removed: ${sinks.joinToString { describe(it) }}; ${snapshot()}")
++    }
++  }
++
++  private val heartbeat = object : Runnable {
++    override fun run() {
++      if (player.isPlaying) {
++        log("heartbeat: ${snapshot()}")
++        handler.postDelayed(this, HEARTBEAT_MS)
++      }
++    }
++  }
++
++  fun attach() {
++    player.addAnalyticsListener(this)
++    try { audioManager.registerAudioDeviceCallback(deviceCallback, handler) } catch (_: Exception) {}
++    log("diagnostics on; outputs: ${outputs()}")
++  }
++
++  fun detach() {
++    handler.removeCallbacks(heartbeat)
++    try { player.removeAnalyticsListener(this) } catch (_: Exception) {}
++    try { audioManager.unregisterAudioDeviceCallback(deviceCallback) } catch (_: Exception) {}
++  }
++
++  // the log store is a synchronous database write: keep it off the main thread
++  private fun log(msg: String) { io.execute { AbsLogger.info(tag, msg) } }
++  private fun error(msg: String) { io.execute { AbsLogger.error(tag, msg) } }
++
++  private fun interesting(d: AudioDeviceInfo) =
++    d.type != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE && d.type != AudioDeviceInfo.TYPE_TELEPHONY &&
++      d.type != AudioDeviceInfo.TYPE_BUILTIN_MIC && d.type != AudioDeviceInfo.TYPE_FM_TUNER
++
++  private fun describe(d: AudioDeviceInfo): String {
++    val type = when (d.type) {
++      AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
++      AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired headset"
++      AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired headphones"
++      AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "bluetooth"
++      AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth (call)"
++      AudioDeviceInfo.TYPE_USB_HEADSET -> "usb headset"
++      AudioDeviceInfo.TYPE_USB_DEVICE -> "usb"
++      AudioDeviceInfo.TYPE_HDMI -> "hdmi"
++      AudioDeviceInfo.TYPE_HEARING_AID -> "hearing aid"
++      26 -> "bluetooth le" // TYPE_BLE_HEADSET, API 31
++      27 -> "bluetooth le speaker"
++      30 -> "bluetooth le broadcast"
++      else -> "type ${d.type}"
++    }
++    val name = d.productName?.toString()?.trim().orEmpty()
++    return if (name.isNotEmpty() && d.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) "$type ($name)" else type
++  }
++
++  private fun outputs(): String = try {
++    audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { interesting(it) }.joinToString { describe(it) }
++  } catch (_: Exception) { "?" }
++
++  private fun stateName(state: Int) = when (state) {
++    Player.STATE_IDLE -> "idle"
++    Player.STATE_BUFFERING -> "buffering"
++    Player.STATE_READY -> "ready"
++    Player.STATE_ENDED -> "ended"
++    else -> "$state"
++  }
++
++  /** One line of everything that decides whether sound comes out. Main thread only. */
++  private fun snapshot(): String = try {
++    val pos = player.currentPosition
++    val ahead = (player.bufferedPosition - pos) / 1000
++    val suppression = when (player.playbackSuppressionReason) {
++      Player.PLAYBACK_SUPPRESSION_REASON_NONE -> "none"
++      Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS -> "AUDIO FOCUS LOSS"
++      else -> "${player.playbackSuppressionReason}"
++    }
++    String.format(Locale.US, "pos %ds buffered +%ds state=%s playWhenReady=%s suppression=%s vol=%.2f devVol=%d/%d speed=%.2f loading=%s musicActive=%s outputs=%s",
++      pos / 1000, ahead, stateName(player.playbackState), player.playWhenReady, suppression, player.volume,
++      audioManager.getStreamVolume(AudioManager.STREAM_MUSIC), audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
++      player.playbackParameters.speed, player.isLoading, audioManager.isMusicActive, outputs())
++  } catch (e: Exception) { "snapshot failed: ${e.message}" }
++
++  override fun onPlayWhenReadyChanged(eventTime: EventTime, playWhenReady: Boolean, reason: Int) {
++    val why = when (reason) {
++      Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST -> "user"
++      Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> "AUDIO FOCUS LOSS"
++      Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> "audio becoming noisy (output unplugged or disconnected)"
++      Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> "remote"
++      Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM -> "end of item"
++      else -> "$reason"
++    }
++    log("playWhenReady=$playWhenReady ($why)")
++  }
++
++  override fun onPlaybackSuppressionReasonChanged(eventTime: EventTime, playbackSuppressionReason: Int) {
++    if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS)
++      error("playback SUPPRESSED by a transient audio focus loss: the player keeps its state but no sound until focus returns; ${snapshot()}")
++    else log("playback suppression cleared; ${snapshot()}")
++  }
++
++  override fun onIsPlayingChanged(eventTime: EventTime, isPlaying: Boolean) {
++    log("isPlaying=$isPlaying; ${snapshot()}")
++    handler.removeCallbacks(heartbeat)
++    if (isPlaying) handler.postDelayed(heartbeat, HEARTBEAT_MS)
++  }
++
++  override fun onPlaybackStateChanged(eventTime: EventTime, state: Int) {
++    if (state == lastState) return
++    lastState = state
++    log("state=${stateName(state)}; ${snapshot()}")
++  }
++
++  override fun onPlayerError(eventTime: EventTime, err: PlaybackException) {
++    error("player error ${err.errorCodeName}: ${err.message}; cause=${err.cause?.javaClass?.simpleName} ${err.cause?.message?.take(160)}")
++  }
++
++  override fun onAudioSinkError(eventTime: EventTime, audioSinkError: Exception) {
++    error("audio sink error: ${audioSinkError.javaClass.simpleName} ${audioSinkError.message?.take(160)}; ${snapshot()}")
++  }
++
++  override fun onAudioCodecError(eventTime: EventTime, audioCodecError: Exception) {
++    error("audio codec error: ${audioCodecError.javaClass.simpleName} ${audioCodecError.message?.take(160)}")
++  }
++
++  override fun onAudioUnderrun(eventTime: EventTime, bufferSize: Int, bufferSizeMs: Long, elapsedSinceLastFeedMs: Long) {
++    log("audio underrun: sink buffer $bufferSizeMs ms, $elapsedSinceLastFeedMs ms since last feed; ${snapshot()}")
++  }
++
++  override fun onAudioPositionAdvancing(eventTime: EventTime, playoutStartSystemTimeMs: Long) {
++    log("audio sink advancing (sound is being output); outputs=${outputs()}")
++  }
++
++  override fun onAudioSessionIdChanged(eventTime: EventTime, audioSessionId: Int) {
++    log("audio session id $audioSessionId")
++  }
++
++  override fun onAudioAttributesChanged(eventTime: EventTime, audioAttributes: AudioAttributes) {
++    log("audio attributes usage=${audioAttributes.usage} content=${audioAttributes.contentType}")
++  }
++
++  override fun onVolumeChanged(eventTime: EventTime, volume: Float) {
++    // the sleep-timer fade changes the volume once a second: log the edges, not every step
++    val full = volume >= 0.999f
++    val now = System.currentTimeMillis()
++    if (full != volumeFull || now - volumeLoggedAt > 30_000L) {
++      volumeFull = full
++      volumeLoggedAt = now
++      log(String.format(Locale.US, "player volume %.2f%s", volume, if (full) "" else " (fading or reduced)"))
++    }
++  }
++
++  override fun onDeviceVolumeChanged(eventTime: EventTime, volume: Int, muted: Boolean) {
++    log("device volume $volume muted=$muted")
++  }
++
++  override fun onSkipSilenceEnabledChanged(eventTime: EventTime, skipSilenceEnabled: Boolean) {
++    log("skip silence $skipSilenceEnabled")
++  }
++
++  override fun onAudioDecoderInitialized(eventTime: EventTime, decoderName: String, initializedTimestampMs: Long, initializationDurationMs: Long) {
++    log("audio decoder $decoderName")
++  }
++
++  override fun onAudioInputFormatChanged(eventTime: EventTime, format: Format, decoderReuseEvaluation: DecoderReuseEvaluation?) {
++    log("audio format ${format.sampleMimeType} ${format.sampleRate} Hz ${format.channelCount} ch ${if (format.bitrate > 0) "${format.bitrate / 1000} kbps" else ""}")
++  }
++
++  override fun onLoadError(eventTime: EventTime, loadEventInfo: LoadEventInfo, mediaLoadData: MediaLoadData, err: IOException, wasCanceled: Boolean) {
++    log("load error ${err.javaClass.simpleName}: ${err.message?.take(160)} (${loadEventInfo.uri.host} ${loadEventInfo.uri.path}) canceled=$wasCanceled")
++  }
++
++  override fun onPositionDiscontinuity(eventTime: EventTime, oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
++    if (reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT || reason == Player.DISCONTINUITY_REASON_INTERNAL) return
++    val why = when (reason) {
++      Player.DISCONTINUITY_REASON_AUTO_TRANSITION -> "next track"
++      Player.DISCONTINUITY_REASON_SEEK -> "seek"
++      Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT -> "seek adjustment"
++      Player.DISCONTINUITY_REASON_SKIP -> "skip"
++      Player.DISCONTINUITY_REASON_REMOVE -> "remove"
++      Player.DISCONTINUITY_REASON_INTERNAL -> "internal"
++      else -> "$reason"
++    }
++    log("position ${oldPosition.positionMs / 1000}s -> ${newPosition.positionMs / 1000}s ($why)")
++  }
++}
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt
+index 8d28b63..0a4ef97 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt
+@@ -106,6 +106,7 @@ class PlayerListener(var playerNotificationService:PlayerNotificationService) :
+         playerNotificationService.mediaProgressSyncer.play(it)
+       }
+     } else {
++      playerNotificationService.prebufferAround("paused") // Release Radar fork
+       playerNotificationService.mediaProgressSyncer.pause {
+         Log.d(tag, "Media Progress Syncer paused and synced")
+       }
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+index 1df22b5..1f3da70 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+@@ -94,6 +94,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     fun onNetworkMeteredChanged(isUnmetered: Boolean)
+     fun onMediaItemHistoryUpdated(mediaItemHistory: MediaItemHistory)
+     fun onPlaybackSpeedChanged(playbackSpeed: Float)
++    fun onPositions(syncedMs: Long, localMs: Long) // Release Radar fork: the session now sits at the synced position; this phone was at localMs
+   }
+   private val binder = LocalBinder()
+ 
+@@ -122,6 +123,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+ 
+   var currentPlaybackSession: PlaybackSession? = null
+   private var initialPlaybackRate: Float? = null
++  private var diagnostics: PlaybackDiagnostics? = null // Release Radar fork
+ 
+   private val metadataScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+   private var metadataArtJob: Job? = null
+@@ -203,6 +205,9 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     isClosed = true
+     DeviceManager.widgetUpdater?.onPlayerChanged(this)
+ 
++    diagnostics?.detach() // Release Radar fork
++    StreamCache.cancel()
++    currentPlaybackSession?.let { s -> if (currentPlayer.playbackState != Player.STATE_IDLE) StreamCache.recordPosition(s.libraryItemId, getCurrentTime()) }
+     playerNotificationManager.setPlayer(null)
+     mPlayer.release()
+     castPlayer?.release()
+@@ -245,6 +250,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     com.audiobookshelf.app.server.ServerRoute.start(ctx) // Release Radar fork
+ 
+     DbManager.initialize(ctx)
++    StreamCache.init(ctx) // Release Radar fork: on-disk cache for streamed audio
+ 
+     // Initialize API
+     apiHandler = ApiHandler(ctx)
+@@ -262,6 +268,8 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     // Initialize media manager
+     mediaManager = MediaManager(apiHandler, ctx)
+ 
++    StreamCache.prebufferLastSession("startup") // Release Radar fork: the last book's window, before anyone presses play
++
+     channelId =
+             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+               createNotificationChannel(channelId, channelName)
+@@ -393,7 +401,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+             DefaultLoadControl.Builder()
+                     .setBufferDurationsMs(
+                             1000 * 60, // 60s min buffer: keep well ahead on a slow tunnel
+-                            1000 * 300, // 300s max buffer (~5 MB at 128 kbps)
++                            1000 * 600, // 600s max buffer (~9 MB at 128 kbps): paused, the player itself keeps 10 min ahead, on disk via the stream cache
+                             1000 * 5, // 5s playback start
+                             1000 * 5 // 5s playback rebuffer (was 20s: a stall waited for 20s of audio)
+                     )
+@@ -411,6 +419,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+                     .build()
+     mPlayer.setHandleAudioBecomingNoisy(true)
+     mPlayer.addListener(PlayerListener(this))
++    diagnostics = PlaybackDiagnostics(ctx, mPlayer).also { it.attach() } // Release Radar fork: Settings > Logs
+     val audioAttributes: AudioAttributes =
+             AudioAttributes.Builder()
+                     .setUsage(C.USAGE_MEDIA)
+@@ -474,11 +483,26 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+       playerNotificationManager.setPlayer(castPlayer)
+     }
+ 
++    // Release Radar fork: remember where this phone left the previous book
++    currentPlaybackSession?.let { prev ->
++      if (prev.libraryItemId != playbackSession.libraryItemId && currentPlayer.playbackState != Player.STATE_IDLE) {
++        StreamCache.recordPosition(prev.libraryItemId, getCurrentTime())
++      }
++    }
++
+     currentPlaybackSession = playbackSession
+     DeviceManager.setLastPlaybackSession(
+             playbackSession
+     ) // Save playback session to use when app is closed
+ 
++    // Release Radar fork: this phone's own position vs the synced one the session starts at.
++    // Both windows stay cached; the player offers the way back to this phone's position.
++    val localPos = StreamCache.localPosition(playbackSession.libraryItemId)
++    StreamCache.setCandidates(playbackSession, playbackSession.currentTimeMs, localPos)
++    if (!playbackSession.isLocal && localPos != null && kotlin.math.abs(localPos - playbackSession.currentTimeMs) > 30_000L) {
++      StreamCache.prebuffer(playbackSession, localPos, "this phone's position", delayMs = 10_000)
++    }
++
+     metadataArtJob?.cancel()
+     metadataArtJob =
+             playbackSession.resolveCoverBitmapAsync(ctx, metadataScope) {
+@@ -500,7 +524,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     }
+ 
+     if (mPlayer == currentPlayer) {
+-      val mediaSource: MediaSource
++      val mediaSources: List<MediaSource> // Release Radar fork: EVERY track through the same factory (cache, home route, retry policy)
+ 
+       if (playbackSession.isLocal) {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Playing local item ${currentPlaybackSession?.mediaItemId}.")
+@@ -515,12 +539,14 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+           extractorsFactory.setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING)
+         }
+ 
+-        mediaSource =
+-                ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
+-                        .createMediaSource(mediaItems[0])
++        val factory = ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
++        mediaSources = mediaItems.map { factory.createMediaSource(it) }
+       } else if (!playbackSession.isHLS) {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Direct playing item ${currentPlaybackSession?.mediaItemId}.")
+-        val dataSourceFactory = OkHttpDataSource.Factory(AbsHttp.client) // Release Radar fork: shared pool, IPv4 first
++        val httpFactory = OkHttpDataSource.Factory(AbsHttp.client) // Release Radar fork: shared pool, IPv4 first
++        httpFactory.setUserAgent(channelId)
++        StreamCache.register(playbackSession)
++        val dataSourceFactory = StreamCache.wrap(httpFactory) // Release Radar fork: index + audio around the position from disk
+ 
+         val extractorsFactory = DefaultExtractorsFactory()
+         extractorsFactory.setConstantBitrateSeekingEnabled(true)
+@@ -531,11 +557,9 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+           extractorsFactory.setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING)
+         }
+ 
+-        dataSourceFactory.setUserAgent(channelId)
+-        mediaSource =
+-                ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
+-                        .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(8)) // Release Radar fork: ride out a home<->tunnel switch
+-                        .createMediaSource(mediaItems[0])
++        val factory = ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
++                .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(8)) // Release Radar fork: ride out a home<->tunnel switch
++        mediaSources = mediaItems.map { factory.createMediaSource(it) }
+       } else {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Playing HLS stream of item ${currentPlaybackSession?.mediaItemId}.")
+         val dataSourceFactory = OkHttpDataSource.Factory(AbsHttp.client) // Release Radar fork: shared pool, IPv4 first
+@@ -543,13 +567,12 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+         dataSourceFactory.setDefaultRequestProperties(
+                 hashMapOf("Authorization" to "Bearer ${DeviceManager.token}")
+         )
+-        mediaSource = HlsMediaSource.Factory(dataSourceFactory).createMediaSource(mediaItems[0])
++        val factory = HlsMediaSource.Factory(dataSourceFactory)
++        mediaSources = mediaItems.map { factory.createMediaSource(it) }
+       }
+-      mPlayer.setMediaSource(mediaSource)
++      mPlayer.setMediaSources(mediaSources)
+ 
+-      // Add remaining media items if multi-track
+       if (mediaItems.size > 1) {
+-        currentPlayer.addMediaItems(mediaItems.subList(1, mediaItems.size))
+         Log.d(tag, "currentPlayer total media items ${currentPlayer.mediaItemCount}")
+ 
+         val currentTrackIndex = playbackSession.getCurrentTrackIndex()
+@@ -961,13 +984,71 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+       return
+     }
+     currentPlayer.volume = 1F
++    // Release Radar fork: after a longer pause, ask the server where the book is before continuing
++    // (another device may have moved it); never wait more than 2 s for the answer
++    val pausedForMs = if (PlayerListener.lastPauseTime > 0) System.currentTimeMillis() - PlayerListener.lastPauseTime else 0L
++    if (pausedForMs > 60_000L && currentPlaybackSession?.isLocal == false && currentPlayer == mPlayer) {
++      var started = false
++      val start = Runnable { if (!started) { started = true; currentPlayer.play() } }
++      val main = android.os.Handler(android.os.Looper.getMainLooper())
++      main.postDelayed(start, 2000)
++      reconcileServerProgress("play") { main.post(start) }
++      return
++    }
+     currentPlayer.play()
+   }
+ 
++  // Release Radar fork: another device may have moved the server's position since this phone last
++  // synced. Continue from there and keep this phone's position one tap away (the Audible way).
++  fun reconcileServerProgress(reason: String, cb: ((moved: Boolean) -> Unit)? = null) {
++    val session = currentPlaybackSession
++    val itemId = session?.libraryItemId
++    if (session == null || itemId == null || session.isLocal || currentPlayer.playbackState == Player.STATE_IDLE) {
++      cb?.invoke(false)
++      return
++    }
++    val sinceMs = mediaProgressSyncer.lastSyncedAt
++    apiHandler.getMediaProgress(itemId, session.episodeId, null) { progress ->
++      android.os.Handler(android.os.Looper.getMainLooper()).post {
++        if (progress == null || currentPlaybackSession?.id != session.id) {
++          cb?.invoke(false)
++          return@post
++        }
++        val serverMs = (progress.currentTime * 1000).toLong()
++        val hereMs = getCurrentTime()
++        val newer = progress.lastUpdate > sinceMs + 2000
++        if (!newer || kotlin.math.abs(serverMs - hereMs) < 30_000L) {
++          cb?.invoke(false)
++          return@post
++        }
++        AbsLogger.info("PlayerNotificationService", "reconcile ($reason): the server is at ${serverMs / 1000} s (newer than this phone's sync), this phone at ${hereMs / 1000} s: continuing from the server")
++        StreamCache.recordPosition(itemId, hereMs)
++        StreamCache.setCandidates(session, serverMs, hereMs)
++        seekPlayer(serverMs)
++        StreamCache.prebuffer(session, listOf(serverMs, hereMs), "reconcile", delayMs = 2000)
++        clientEventEmitter?.onPositions(serverMs, hereMs)
++        cb?.invoke(true)
++      }
++    }
++  }
++
+   fun pause() {
+     currentPlayer.pause()
+   }
+ 
++  // Release Radar fork: on pause, remember where this phone is. The player itself keeps the next
++  // 10 min loaded (through the cache); the OTHER position of this book (synced vs this phone) is
++  // written by the pre-buffer so the way back is instant too.
++  fun prebufferAround(reason: String) {
++    val session = currentPlaybackSession ?: return
++    if (isClosed || currentPlayer.playbackState == Player.STATE_IDLE) return
++    val position = getCurrentTime()
++    StreamCache.recordPosition(session.libraryItemId, position)
++    if (session.isLocal || !session.isDirectPlay || currentPlayer != mPlayer) return
++    val others = StreamCache.candidates(session).filter { kotlin.math.abs(it - position) > 90_000L }
++    if (others.isNotEmpty()) StreamCache.prebuffer(session, others, reason, delayMs = 3000)
++  }
++
+   fun playPause(): Boolean {
+     return if (currentPlayer.isPlaying) {
+       pause()
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt b/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt
+new file mode 100644
+index 0000000..5dd2426
+--- /dev/null
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt
+@@ -0,0 +1,346 @@
++package com.audiobookshelf.app.player
++
++import android.content.Context
++import android.content.SharedPreferences
++import android.net.ConnectivityManager
++import android.util.Log
++import com.audiobookshelf.app.data.AudioTrack
++import com.audiobookshelf.app.data.PlaybackSession
++import com.audiobookshelf.app.device.DeviceManager
++import com.audiobookshelf.app.plugins.AbsLogger
++import com.audiobookshelf.app.server.AbsHttp
++import com.google.android.exoplayer2.C
++import com.google.android.exoplayer2.database.StandaloneDatabaseProvider
++import com.google.android.exoplayer2.ext.okhttp.OkHttpDataSource
++import com.google.android.exoplayer2.upstream.DataSource
++import com.google.android.exoplayer2.upstream.DataSpec
++import com.google.android.exoplayer2.upstream.HttpDataSource
++import com.google.android.exoplayer2.upstream.cache.CacheDataSource
++import com.google.android.exoplayer2.upstream.cache.CacheKeyFactory
++import com.google.android.exoplayer2.upstream.cache.CacheWriter
++import com.google.android.exoplayer2.upstream.cache.LeastRecentlyUsedCacheEvictor
++import com.google.android.exoplayer2.upstream.cache.SimpleCache
++import org.json.JSONObject
++import java.io.File
++import java.io.InterruptedIOException
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.Executors
++import java.util.concurrent.Future
++import java.util.concurrent.TimeUnit
++import kotlin.math.abs
++
++/**
++ * Release Radar fork: an on-disk cache for streamed (direct play) audio, so the
++ * last played book starts from the phone instead of from the server.
++ *
++ * Everything ExoPlayer reads for a streamed book passes through this cache: the
++ * index at the head of the file (up to tens of MB, read on every open) and the
++ * audio it buffers around the playhead, which the load control keeps ten
++ * minutes ahead while paused. On top of that, [prebuffer] writes windows of
++ * [BEHIND_S] before and [AHEAD_S] after positions the player is NOT sitting at:
++ * where this phone left the book (recorded here, every 15 s while playing and
++ * on pause) and where the server says it is (the synced position another
++ * device may have moved). Both windows are kept, so starting at either is
++ * instant, and the player offers the way back.
++ *
++ * Stream URLs are per server session, so entries are keyed by the file they
++ * point at (item, track, size, duration, path) rather than by URL: the cache
++ * survives new sessions, token refreshes and the home-network/tunnel switch.
++ */
++object StreamCache {
++  private const val tag = "StreamCache"
++  private const val MAX_BYTES = 768L * 1024 * 1024
++  private const val BEHIND_S = 60.0
++  private const val AHEAD_S = 600.0
++  private const val STARTUP_MAX_AGE_MS = 24L * 3600 * 1000
++  private const val SAME_WINDOW_MS = 90_000L
++  private const val POSITIONS_KEPT = 12
++  private const val NO_PROGRESS_MS = 20_000L
++
++  @Volatile private var cache: SimpleCache? = null
++  private var prefs: SharedPreferences? = null
++  private var appContext: Context? = null
++  private val keys = ConcurrentHashMap<String, String>()
++  private val audioStarts = ConcurrentHashMap<String, Long>()
++  private val executor = Executors.newSingleThreadScheduledExecutor { r ->
++    Thread(r, "stream-prebuffer").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
++  }
++  private val watchdog = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "stream-prebuffer-watchdog").apply { isDaemon = true } }
++  @Volatile private var task: Future<*>? = null
++  @Volatile private var writer: CacheWriter? = null
++  @Volatile private var generation = 0
++  @Volatile private var upstream: DataSource.Factory? = null
++
++  /** Per session: the synced position it started at and where this phone was before. */
++  @Volatile private var candidateSessionId: String? = null
++  @Volatile private var syncedStartMs: Long? = null
++  @Volatile private var localStartMs: Long? = null
++
++  private val keyFactory = CacheKeyFactory { spec ->
++    keys[stripToken(spec.uri.toString())] ?: CacheKeyFactory.DEFAULT.buildCacheKey(spec)
++  }
++
++  @Synchronized
++  fun init(ctx: Context) {
++    if (cache != null) return
++    try {
++      appContext = ctx.applicationContext
++      val dir = File(ctx.filesDir, "stream-cache")
++      cache = SimpleCache(dir, LeastRecentlyUsedCacheEvictor(MAX_BYTES), StandaloneDatabaseProvider(ctx))
++      prefs = ctx.getSharedPreferences("stream-cache", Context.MODE_PRIVATE)
++      AbsLogger.info(tag, "init: ${(cache?.cacheSpace ?: 0) / 1048576} MB cached, limit ${MAX_BYTES / 1048576} MB")
++    } catch (e: Exception) {
++      AbsLogger.error(tag, "init failed, streaming without a cache: ${e.javaClass.simpleName} ${e.message}")
++    }
++  }
++
++  private fun stripToken(uri: String): String {
++    val q = uri.indexOf("?token=")
++    return if (q >= 0) uri.substring(0, q) else uri
++  }
++
++  private fun key(session: PlaybackSession, track: AudioTrack): String =
++    "${session.libraryItemId}|${track.index}|${track.metadata?.size ?: 0}|${track.durationMs}|${track.metadata?.relPath ?: ""}"
++
++  /** Map this session's stream URLs to file-based cache keys. */
++  fun register(session: PlaybackSession) {
++    if (session.isLocal || !session.isDirectPlay) return
++    session.audioTracks.forEach { t ->
++      keys[stripToken(session.getContentUri(t).toString())] = key(session, t)
++    }
++  }
++
++  /** The player's data source: cache in front of the network. */
++  fun wrap(factory: DataSource.Factory): DataSource.Factory {
++    val c = cache ?: return factory
++    upstream = factory
++    return CacheDataSource.Factory()
++      .setCache(c)
++      .setUpstreamDataSourceFactory(factory)
++      .setCacheKeyFactory(keyFactory)
++      .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
++  }
++
++  private fun metered(): Boolean = try {
++    val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
++    cm?.isActiveNetworkMetered ?: false
++  } catch (_: Exception) { false }
++
++  // ---- the positions of this phone, per library item ----
++
++  @Synchronized
++  fun recordPosition(itemId: String?, positionMs: Long) {
++    val p = prefs ?: return
++    if (itemId.isNullOrEmpty() || positionMs < 0) return
++    try {
++      val all = JSONObject(p.getString("positions", "{}") ?: "{}")
++      all.put(itemId, JSONObject().put("ms", positionMs).put("at", System.currentTimeMillis()))
++      if (all.length() > POSITIONS_KEPT) {
++        val oldest = all.keys().asSequence().minByOrNull { all.getJSONObject(it).optLong("at") }
++        if (oldest != null) all.remove(oldest)
++      }
++      p.edit().putString("positions", all.toString()).apply()
++    } catch (e: Exception) {
++      Log.w(tag, "recordPosition: ${e.message}")
++    }
++  }
++
++  @Synchronized
++  fun localPosition(itemId: String?): Long? {
++    val p = prefs ?: return null
++    if (itemId.isNullOrEmpty()) return null
++    return try {
++      JSONObject(p.getString("positions", "{}") ?: "{}").optJSONObject(itemId)?.optLong("ms")
++    } catch (e: Exception) { null }
++  }
++
++  /** Remember the two positions that matter for this session. */
++  fun setCandidates(session: PlaybackSession, syncedMs: Long, localMs: Long?) {
++    candidateSessionId = session.id
++    syncedStartMs = syncedMs
++    localStartMs = localMs
++  }
++
++  fun syncedStart(session: PlaybackSession): Long? = if (candidateSessionId == session.id) syncedStartMs else null
++  fun localStart(session: PlaybackSession): Long? = if (candidateSessionId == session.id) localStartMs else null
++
++  /** The positions to keep cached for this session, besides the one the player sits at. */
++  fun candidates(session: PlaybackSession): List<Long> =
++    if (candidateSessionId == session.id) listOfNotNull(syncedStartMs, localStartMs) else emptyList()
++
++  // ---- where the audio starts in the file ----
++
++  private fun readAt(ds: DataSource, session: PlaybackSession, track: AudioTrack, position: Long, length: Int): ByteArray? {
++    val spec = DataSpec.Builder().setUri(session.getContentUri(track)).setPosition(position).setLength(length.toLong())
++      .setKey(key(session, track)).build()
++    return try {
++      ds.open(spec)
++      val buf = ByteArray(length)
++      var off = 0
++      while (off < length) {
++        val n = ds.read(buf, off, length - off)
++        if (n == C.RESULT_END_OF_INPUT) break
++        off += n
++      }
++      buf.copyOf(off)
++    } catch (e: Exception) {
++      null
++    } finally {
++      try { ds.close() } catch (_: Exception) {}
++    }
++  }
++
++  private fun u32(b: ByteArray, o: Int): Long =
++    ((b[o].toLong() and 0xff) shl 24) or ((b[o + 1].toLong() and 0xff) shl 16) or ((b[o + 2].toLong() and 0xff) shl 8) or (b[o + 3].toLong() and 0xff)
++
++  /**
++   * For MP4-family files the audio bytes start at the mdat box, after an index
++   * that can be tens of MB; the byte estimate for a time must skip it. Walks
++   * the top-level boxes (a few 16-byte reads, served from the cache once the
++   * player has opened the file). Other formats start at 0.
++   */
++  private fun audioStart(session: PlaybackSession, track: AudioTrack, c: SimpleCache): Long {
++    val ext = (track.metadata?.ext ?: "").lowercase().trimStart('.')
++    if (ext !in setOf("m4b", "m4a", "mp4", "aac") && !(track.mimeType ?: "").contains("mp4")) return 0L
++    val k = key(session, track)
++    audioStarts[k]?.let { return it }
++    val size = track.metadata?.size ?: return 0L
++    val ds = CacheDataSource.Factory().setCache(c).setUpstreamDataSourceFactory(upstream ?: OkHttpDataSource.Factory(AbsHttp.client))
++      .setCacheKeyFactory(keyFactory).setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR).createDataSource()
++    var off = 0L
++    var found = 0L
++    for (i in 0 until 12) {
++      val hdr = readAt(ds, session, track, off, 16) ?: break
++      if (hdr.size < 8) break
++      var boxSize = u32(hdr, 0)
++      val type = String(hdr, 4, 4, Charsets.ISO_8859_1)
++      if (boxSize == 1L && hdr.size >= 16) boxSize = (u32(hdr, 8) shl 32) or u32(hdr, 12)
++      if (boxSize == 0L) boxSize = size - off
++      if (type == "mdat") { found = off; break }
++      if (boxSize < 8 || off + boxSize >= size) break
++      off += boxSize
++    }
++    audioStarts[k] = found
++    return found
++  }
++
++  // ---- the pre-buffer ----
++
++  private data class Window(val track: AudioTrack, val from: Long, val to: Long, val aroundMs: Long)
++
++  private fun window(session: PlaybackSession, positionMs: Long, c: SimpleCache): Window? {
++    val track = session.audioTracks.firstOrNull { positionMs >= it.startOffsetMs && positionMs < it.endOffsetMs }
++      ?: session.audioTracks.lastOrNull() ?: return null
++    val size = track.metadata?.size ?: return null
++    if (size <= 0 || track.duration <= 0) return null
++    val header = audioStart(session, track, c).coerceIn(0L, size)
++    val bytesPerSecond = (size - header) / track.duration
++    val trackPosS = (positionMs - track.startOffsetMs) / 1000.0
++    val from = header + ((trackPosS - BEHIND_S).coerceAtLeast(0.0) * bytesPerSecond).toLong()
++    val to = (header + ((trackPosS + AHEAD_S) * bytesPerSecond).toLong()).coerceAtMost(size)
++    return if (to > from) Window(track, from, to, positionMs) else null
++  }
++
++  /**
++   * Keep the audio around each of [positionsMs] (session time) on disk. Runs on
++   * its own thread; cancelled by the next call, by [cancel], or by the watchdog
++   * when a window makes no progress for [NO_PROGRESS_MS] (the player holding
++   * the same range open, or a dead server session). Skipped on metered networks.
++   */
++  fun prebuffer(session: PlaybackSession, positionsMs: List<Long>, reason: String, delayMs: Long = 0) {
++    val c = cache ?: return
++    if (session.isLocal || !session.isDirectPlay) return
++    if (positionsMs.isEmpty()) return
++    register(session)
++    try {
++      prefs?.edit()?.putString("sessionId", session.id)?.putLong("positionMs", positionsMs.first())
++        ?.putLong("at", System.currentTimeMillis())?.apply()
++    } catch (_: Exception) {}
++    val gen = ++generation
++    cancelRunning()
++    task = executor.schedule({
++      if (metered()) { Log.d(tag, "prebuffer ($reason): metered network, skipped"); return@schedule }
++      val distinct = mutableListOf<Long>()
++      positionsMs.forEach { p -> if (distinct.none { abs(it - p) < SAME_WINDOW_MS }) distinct.add(p) }
++      val windows = distinct.mapNotNull { window(session, it, c) }
++      for (w in windows) {
++        if (gen != generation || Thread.currentThread().isInterrupted) return@schedule
++        val key = key(session, w.track)
++        val wanted = w.to - w.from
++        val have = c.getCachedBytes(key, w.from, wanted)
++        if (have >= wanted) {
++          Log.d(tag, "prebuffer ($reason): window at ${w.aroundMs / 1000} s already cached")
++          continue
++        }
++        val ds = CacheDataSource.Factory()
++          .setCache(c)
++          .setUpstreamDataSourceFactory(upstream ?: OkHttpDataSource.Factory(AbsHttp.client))
++          .setCacheKeyFactory(keyFactory)
++          .createDataSourceForDownloading()
++        val spec = DataSpec.Builder().setUri(session.getContentUri(w.track)).setPosition(w.from).setLength(wanted).setKey(key).build()
++        var progressAt = System.currentTimeMillis()
++        val cw = CacheWriter(ds, spec, null) { _, _, _ -> progressAt = System.currentTimeMillis() }
++        writer = cw
++        val me = task
++        val guard = watchdog.scheduleWithFixedDelay({
++          if (System.currentTimeMillis() - progressAt > NO_PROGRESS_MS) {
++            Log.d(tag, "prebuffer ($reason): no progress for ${NO_PROGRESS_MS / 1000} s, giving up on this window")
++            cw.cancel()
++            me?.cancel(true)
++          }
++        }, NO_PROGRESS_MS, 5000, TimeUnit.MILLISECONDS)
++        val t0 = System.currentTimeMillis()
++        try {
++          cw.cache()
++          AbsLogger.info(tag, "prebuffer ($reason): ${(wanted - have) / 1024} KB around ${w.aroundMs / 1000} s of " +
++            "${session.displayTitle} in ${System.currentTimeMillis() - t0} ms")
++        } catch (e: InterruptedIOException) {
++          Log.d(tag, "prebuffer ($reason) cancelled")
++          return@schedule
++        } catch (e: HttpDataSource.InvalidResponseCodeException) {
++          Log.d(tag, "prebuffer ($reason): server answered ${e.responseCode} (session gone?)")
++          return@schedule
++        } catch (e: Exception) {
++          if (Thread.currentThread().isInterrupted) return@schedule
++          AbsLogger.error(tag, "prebuffer ($reason) failed: ${e.javaClass.simpleName} ${e.message?.take(160)}")
++          return@schedule
++        } finally {
++          guard.cancel(false)
++          if (writer === cw) writer = null
++        }
++      }
++    }, delayMs, TimeUnit.MILLISECONDS)
++  }
++
++  fun prebuffer(session: PlaybackSession, positionMs: Long, reason: String, delayMs: Long = 0) =
++    prebuffer(session, listOf(positionMs), reason, delayMs)
++
++  /**
++   * At service start and when the server config is set: warm the windows of
++   * the last streamed book before anyone presses play (only if this phone
++   * touched it within a day, so its server session is likely still open).
++   */
++  fun prebufferLastSession(reason: String) {
++    val s = DeviceManager.deviceData.lastPlaybackSession ?: return
++    if (s.isLocal || !s.isDirectPlay) return
++    if (s.serverConnectionConfigId != DeviceManager.serverConnectionConfigId) return
++    val p = prefs
++    val at = try { p?.getLong("at", 0L) ?: 0L } catch (_: Exception) { 0L }
++    if (System.currentTimeMillis() - at > STARTUP_MAX_AGE_MS) return
++    val positions = mutableListOf<Long>()
++    try { if (p?.getString("sessionId", null) == s.id) positions.add(p.getLong("positionMs", s.currentTimeMs)) } catch (_: Exception) {}
++    localPosition(s.libraryItemId)?.let { positions.add(it) }
++    positions.add(s.currentTimeMs)
++    prebuffer(s, positions, reason)
++  }
++
++  private fun cancelRunning() {
++    writer?.cancel()
++    task?.cancel(true)
++  }
++
++  fun cancel() {
++    generation++
++    cancelRunning()
++  }
++}
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt
+index 6e76637..6df9d76 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt
+@@ -114,6 +114,13 @@ class AbsAudioPlayer : Plugin() {
+         override fun onPlaybackSpeedChanged(playbackSpeed:Float) {
+           emit("onPlaybackSpeedChanged", playbackSpeed)
+         }
++
++        override fun onPositions(syncedMs: Long, localMs: Long) { // Release Radar fork
++          val o = JSObject()
++          o.put("syncedMs", syncedMs)
++          o.put("localMs", localMs)
++          notifyListeners("onPositions", o)
++        }
+       })
+ 
+       MediaEventManager.clientEventEmitter = playerNotificationService.clientEventEmitter
+@@ -292,6 +299,31 @@ class AbsAudioPlayer : Plugin() {
+     }
+   }
+ 
++  // Release Radar fork: the synced position this session started at and where this phone was before
++  @PluginMethod
++  fun getPositions(call: PluginCall) {
++    Handler(Looper.getMainLooper()).post {
++      val ret = JSObject()
++      playerNotificationService.currentPlaybackSession?.let { session ->
++        com.audiobookshelf.app.player.StreamCache.syncedStart(session)?.let { ret.put("syncedMs", it) }
++        com.audiobookshelf.app.player.StreamCache.localStart(session)?.let { ret.put("localMs", it) }
++      }
++      call.resolve(ret)
++    }
++  }
++
++  // Release Radar fork: on returning to the app, check whether another device moved the book
++  @PluginMethod
++  fun reconcileServerProgress(call: PluginCall) {
++    Handler(Looper.getMainLooper()).post {
++      playerNotificationService.reconcileServerProgress("foreground") { moved ->
++        val ret = JSObject()
++        ret.put("moved", moved)
++        call.resolve(ret)
++      }
++    }
++  }
++
+   @PluginMethod
+   fun getCurrentTime(call: PluginCall) {
+     Handler(Looper.getMainLooper()).post {
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
+index f5824f8..147cc5e 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
+@@ -189,11 +189,31 @@ class AbsDatabase : Plugin() {
+       }
+ 
+       DeviceManager.serverConnectionConfig = serverConnectionConfig
++      ServerRoute.markDown("config set") // nothing goes to a home address this pair has not been verified for
+       ServerRoute.probe("config set", force = true)
++      com.audiobookshelf.app.player.StreamCache.prebufferLastSession("config set")
+       call.resolve(JSObject(jacksonMapper.writeValueAsString(DeviceManager.serverConnectionConfig)))
+     }
+   }
+ 
++  // Release Radar fork: set only the home-network address of the current config ("" clears it).
++  // Tokens and everything else stay as they are on the native side.
++  @PluginMethod
++  fun setLocalAddress(call:PluginCall) {
++    val cleaned = (call.getString("localAddress") ?: "").trim().trimEnd('/').takeIf { it.isNotEmpty() }
++    val config = DeviceManager.serverConnectionConfig
++    if (config == null) {
++      call.resolve(JSObject("{\"error\":\"No server connection\"}"))
++      return
++    }
++    config.localAddress = cleaned
++    DeviceManager.deviceData.serverConnectionConfigs.find { it.id == config.id }?.localAddress = cleaned
++    DeviceManager.dbManager.saveDeviceData(DeviceManager.deviceData)
++    ServerRoute.markDown("home address changed")
++    ServerRoute.probe("home address changed", force = true)
++    call.resolve(JSObject(jacksonMapper.writeValueAsString(config)))
++  }
++
+   // Release Radar fork: which address the app is talking to right now
+   @PluginMethod
+   fun getServerRoute(call:PluginCall) {
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt b/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
+index 2d8fbe6..6df0c00 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
+@@ -13,6 +13,10 @@ import okhttp3.Request
+ import okhttp3.Response
+ import org.json.JSONObject
+ import java.io.IOException
++import java.net.ConnectException
++import java.net.NoRouteToHostException
++import java.net.SocketTimeoutException
++import java.net.UnknownHostException
+ import java.util.concurrent.Executors
+ import java.util.concurrent.ScheduledFuture
+ import java.util.concurrent.TimeUnit
+@@ -28,9 +32,13 @@ import java.util.concurrent.TimeUnit
+  * moment it stops answering the next request goes back to the canonical
+  * address on its own. The live socket stays on the canonical address.
+  *
+- * The home address is trusted only after it has proved to be the same server:
+- * /healthcheck answers, /status is Audiobookshelf, and /api/me with our token
+- * returns our own user id (a different server cannot validate our token).
++ * The home address is used only while the pair (canonical, home) that was
++ * verified is still the configured pair, and every probe proves the same
++ * server again: /healthcheck answers, /status is Audiobookshelf with our
++ * server version, and /api/me with our token returns our own user id (a
++ * different server cannot validate our token). Nothing is remembered across
++ * networks: joining another Wi-Fi where that address belongs to someone else
++ * never gets our token on the strength of an old check.
+  */
+ object ServerRoute {
+   private const val tag = "ServerRoute"
+@@ -40,7 +48,8 @@ object ServerRoute {
+ 
+   @Volatile var lanOk = false
+     private set
+-  @Volatile private var verifiedLocal: String? = null
++  /** The "canonical|home" pair the current lanOk was verified for. */
++  @Volatile private var upFor: String? = null
+   @Volatile private var downUntil = 0L
+   @Volatile private var lastProbeAt = 0L
+   @Volatile private var started = false
+@@ -63,7 +72,13 @@ object ServerRoute {
+     return if (l.isEmpty() || l == canonical) null else l
+   }
+ 
+-  fun isLocal(): Boolean = lanOk && local != null
++  private fun pair(): String? {
++    val c = canonical ?: return null
++    val l = local ?: return null
++    return "$c|$l"
++  }
++
++  fun isLocal(): Boolean = lanOk && upFor != null && upFor == pair()
+   fun active(): String? = if (isLocal()) local else canonical
+ 
+   fun state(): JSObject {
+@@ -79,7 +94,7 @@ object ServerRoute {
+   fun rewrite(url: String): String {
+     val c = canonical ?: return url
+     val l = local ?: return url
+-    return if (lanOk) {
++    return if (isLocal()) {
+       if (url.startsWith("$c/") || url == c) l + url.substring(c.length) else url
+     } else {
+       if (url.startsWith("$l/") || url == l) c + url.substring(l.length) else url
+@@ -93,8 +108,9 @@ object ServerRoute {
+   }
+ 
+   fun markDown(why: String) {
+-    val was = lanOk
++    val was = isLocal()
+     lanOk = false
++    upFor = null
+     downUntil = System.currentTimeMillis() + DOWN_HOLD_MS
+     if (was) {
+       Log.i(tag, "home address off: $why")
+@@ -102,9 +118,11 @@ object ServerRoute {
+     }
+   }
+ 
+-  private fun markUp() {
+-    if (!lanOk) {
+-      lanOk = true
++  private fun markUp(forPair: String) {
++    val was = isLocal()
++    lanOk = true
++    upFor = forPair
++    if (!was) {
+       Log.i(tag, "home address on: ${local}")
+       notifyJs()
+     }
+@@ -129,12 +147,17 @@ object ServerRoute {
+     executor.execute {
+       try {
+         val now = System.currentTimeMillis()
+-        if (local == null) { if (lanOk) markDown("no home address"); return@execute }
+-        if (!force && now < downUntil) return@execute
+-        if (!force && now - lastProbeAt < PROBE_MIN_GAP_MS && lanOk) return@execute
++        val p = pair()
++        if (p == null) { if (lanOk) markDown("no home address"); return@execute }
++        if (!force && now < downUntil) {
++          // held off: check again when the hold ends instead of forgetting the request
++          probeSoon(reason, downUntil - now + 100)
++          return@execute
++        }
++        if (!force && now - lastProbeAt < PROBE_MIN_GAP_MS && isLocal()) return@execute
+         lastProbeAt = now
+         val ok = try { sameServerReachable() } catch (e: Exception) { Log.d(tag, "probe ($reason): ${e.javaClass.simpleName} ${e.message}"); false }
+-        if (ok) markUp() else markDown("probe ($reason) failed")
++        if (ok && p == pair()) markUp(p) else markDown("probe ($reason) failed")
+       } catch (e: Exception) {
+         Log.w(tag, "probe error: ${e.message}")
+       }
+@@ -147,12 +170,11 @@ object ServerRoute {
+     return probeClient.newCall(b.build()).execute()
+   }
+ 
++  /** The full check, every time: the same server, proven before the token is sent there. */
+   private fun sameServerReachable(): Boolean {
+     val l = local ?: return false
+     val cfg = DeviceManager.serverConnectionConfig ?: return false
+     get("$l/healthcheck").use { if (!it.isSuccessful) return false }
+-    if (verifiedLocal == l) return true
+-    // the same server, proven before the token is ever sent there
+     get("$l/status").use { r ->
+       if (!r.isSuccessful) return false
+       val j = JSONObject(r.body?.string() ?: return false)
+@@ -169,7 +191,6 @@ object ServerRoute {
+       val j = JSONObject(r.body?.string() ?: return false)
+       if (j.optString("id") != cfg.userId) return false
+     }
+-    verifiedLocal = l
+     return true
+   }
+ 
+@@ -181,7 +202,7 @@ object ServerRoute {
+     try {
+       val cm = ctx.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+       cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+-        override fun onAvailable(network: Network) { probeSoon("network available") }
++        override fun onAvailable(network: Network) { markDown("network changed"); probeSoon("network available", 500) }
+         override fun onLost(network: Network) { markDown("network lost"); probeSoon("network lost", 3000) }
+         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+           // Wi-Fi <-> cellular hand-over: re-check straight away
+@@ -194,23 +215,34 @@ object ServerRoute {
+     probeSoon("start", 500)
+   }
+ 
++  /** Only a failure to reach the home address says anything about the route. */
++  private fun isConnectFailure(e: IOException): Boolean =
++    e is ConnectException || e is UnknownHostException || e is NoRouteToHostException ||
++      (e is SocketTimeoutException && (e.message ?: "").contains("connect", ignoreCase = true))
++
+   /**
+    * Installed on the shared OkHttp client (API, player, downloads). A request
+    * for the canonical address goes to the home address while that is up;
+-   * if the home address fails to connect, the request is retried once on the
+-   * canonical address and the home address is held off for a while.
++   * if the home address cannot be reached, the request is retried once on the
++   * canonical address and the home address is held off for a while. A call
++   * the caller cancelled (the player seeking or stopping) says nothing about
++   * the route and is left alone.
+    */
+   val interceptor = Interceptor { chain ->
+     val original = chain.request()
+     val url = original.url.toString()
+     val routed = rewrite(url)
+-    val viaLocal = routed != url && lanOk && local != null && routed.startsWith(local!!)
++    val l = local
++    val viaLocal = routed != url && isLocal() && l != null && routed.startsWith(l)
+     val request = if (routed == url) original else original.newBuilder().url(routed).build()
+     if (!viaLocal) return@Interceptor chain.proceed(request)
+     try {
+       chain.withConnectTimeout(CONNECT_MS.toInt(), TimeUnit.MILLISECONDS).proceed(request)
+     } catch (e: IOException) {
++      if (chain.call().isCanceled()) throw e
++      if (!isConnectFailure(e)) throw e
+       markDown("request failed: ${e.javaClass.simpleName}")
++      probeSoon("after failure", DOWN_HOLD_MS + 100)
+       val idempotent = original.method == "GET" || original.method == "HEAD"
+       if (!idempotent) throw e
+       chain.proceed(original.newBuilder().url(toCanonical(url)).build())
+diff --git a/components/app/AudioPlayer.vue b/components/app/AudioPlayer.vue
+index 4ecb5df..3aca868 100644
+--- a/components/app/AudioPlayer.vue
++++ b/components/app/AudioPlayer.vue
+@@ -186,7 +186,9 @@ export default {
+       coverRgb: 'rgb(55, 56, 56)',
+       coverBgIsLight: false,
+       titleMarquee: null,
+-      isRefreshingUI: false
++      isRefreshingUI: false,
++      positions: null, // Release Radar fork: { syncedMs, localMs } when this phone was somewhere else
++      atLocalPosition: false
+     }
+   },
+   watch: {
+@@ -224,6 +226,15 @@ export default {
+           icon: 'schedule'
+         })
+       }
++      // Release Radar fork: the session started at the synced position; this phone was somewhere else
++      if (this.positions) {
++        const toLocal = !this.atLocalPosition
++        items.push({
++          text: toLocal ? `This phone was at ${this.$secondsToTimestamp(this.positions.localMs / 1000)}` : `Synced position ${this.$secondsToTimestamp(this.positions.syncedMs / 1000)}`,
++          value: toLocal ? 'local_position' : 'synced_position',
++          icon: toLocal ? 'history' : 'sync'
++        })
++      }
+ 
+       items.push(
+         ...[
+@@ -426,6 +437,26 @@ export default {
+     }
+   },
+   methods: {
++    // Release Radar fork: the player moved to the synced position; this phone was somewhere else
++    onPositions(p) {
++      if (!p || p.localMs == null || p.syncedMs == null) return
++      this.positions = { syncedMs: p.syncedMs, localMs: p.localMs }
++      this.atLocalPosition = false
++      this.$toast.info(`Continuing from the synced position. This phone was at ${this.$secondsToTimestamp(p.localMs / 1000)}; the menu takes you back.`, { timeout: 6000 })
++    },
++    onDeviceFocus(hasFocus) {
++      if (hasFocus && this.playbackSession && !this.isPlaying) AbsAudioPlayer.reconcileServerProgress().catch(() => {})
++    },
++    // Release Radar fork: did this session start at a synced position far from where this phone was?
++    async loadPositions() {
++      this.positions = null
++      this.atLocalPosition = false
++      const p = await AbsAudioPlayer.getPositions().catch(() => null)
++      if (p && p.localMs != null && p.syncedMs != null && Math.abs(p.localMs - p.syncedMs) > 30000) {
++        this.positions = p
++        this.$toast.info(`This phone was at ${this.$secondsToTimestamp(p.localMs / 1000)}. The menu takes you back.`, { timeout: 6000 })
++      }
++    },
+     showSyncsFailedDialog() {
+       Dialog.alert({
+         title: this.$strings.HeaderProgressSyncFailed,
+@@ -780,6 +811,11 @@ export default {
+         } else if (action === 'sessions') {
+           this.$router.push(`/media/${this.serverLibraryItemId}/sessions?libraryItemId=${this.serverLibraryItemId}&title=${encodeURIComponent(this.title || '')}`)
+           this.showFullscreen = false
++        } else if (action === 'local_position' || action === 'synced_position') {
++          // Release Radar fork: both windows are cached, so either jump is instant
++          const ms = action === 'local_position' ? this.positions.localMs : this.positions.syncedMs
++          this.atLocalPosition = action === 'local_position'
++          this.seek(ms / 1000)
+         } else if (action === 'scale_elapsed_time') {
+           this.playerSettings.scaleElapsedTimeBySpeed = !this.playerSettings.scaleElapsedTimeBySpeed
+           this.updateTimestamp()
+@@ -892,6 +928,7 @@ export default {
+     onPlaybackSession(playbackSession) {
+       console.log('onPlaybackSession received', JSON.stringify(playbackSession))
+       this.playbackSession = playbackSession
++      this.loadPositions()
+ 
+       this.isEnded = false
+       this.isLoading = true
+@@ -932,6 +969,8 @@ export default {
+       AbsAudioPlayer.addListener('onProgressSyncFailing', this.showProgressSyncIsFailing)
+       AbsAudioPlayer.addListener('onProgressSyncSuccess', this.showProgressSyncSuccess)
+       AbsAudioPlayer.addListener('onPlaybackSpeedChanged', this.onPlaybackSpeedChanged)
++      AbsAudioPlayer.addListener('onPositions', this.onPositions) // Release Radar fork
++      this.$eventBus.$on('device-focus-update', this.onDeviceFocus)
+     },
+     async screenOrientationChange() {
+       if (this.isRefreshingUI) return
+diff --git a/pages/account.vue b/pages/account.vue
+index d3fc0d5..60f3feb 100644
+--- a/pages/account.vue
++++ b/pages/account.vue
+@@ -83,12 +83,15 @@ export default {
+         return
+       }
+       await this.$hapticsImpact()
+-      const config = await this.$db.setServerConnectionConfig({ ...this.serverConnectionConfig, localAddress: cleaned }).catch((error) => {
++      const config = await this.$db.setLocalAddress(cleaned).catch((error) => {
+         console.error('Failed to save home network address', error)
+         this.$toast.error('Could not save the address')
+         return null
+       })
+-      if (!config) return
++      if (!config || config.error) {
++        if (config && config.error) this.$toast.error(config.error)
++        return
++      }
+       this.$store.commit('user/setServerConnectionConfig', config)
+       this.localAddress = config.localAddress || ''
+       if (!cleaned) this.$store.commit('user/setActiveServerAddress', null)
+diff --git a/plugins/capacitor/AbsAudioPlayer.js b/plugins/capacitor/AbsAudioPlayer.js
+index e43d09e..18c47aa 100644
+--- a/plugins/capacitor/AbsAudioPlayer.js
++++ b/plugins/capacitor/AbsAudioPlayer.js
+@@ -159,6 +159,14 @@ class AbsAudioPlayerWeb extends WebPlugin {
+   }
+ 
+   // PluginMethod
++  async getPositions() {
++    return {}
++  }
++
++  async reconcileServerProgress() {
++    return { moved: false }
++  }
++
+   async getCurrentTime() {
+     return {
+       value: this.overallCurrentTime,
+diff --git a/plugins/capacitor/AbsDatabase.js b/plugins/capacitor/AbsDatabase.js
+index fafceb0..481308c 100644
+--- a/plugins/capacitor/AbsDatabase.js
++++ b/plugins/capacitor/AbsDatabase.js
+@@ -85,6 +85,15 @@ class AbsDatabaseWeb extends WebPlugin {
+     return ssc
+   }
+ 
++  async setLocalAddress({ localAddress }) {
++    const deviceData = await this.getDeviceData()
++    const ssc = deviceData.serverConnectionConfigs.find((c) => c.id == deviceData.lastServerConnectionConfigId)
++    if (!ssc) return { error: 'No server connection' }
++    ssc.localAddress = (localAddress || '').trim().replace(/\/+$/, '') || null
++    localStorage.setItem('device', JSON.stringify(deviceData))
++    return ssc
++  }
++
+   async getServerRoute() {
+     const deviceData = await this.getDeviceData()
+     const ssc = deviceData.serverConnectionConfigs.find((c) => c.id == deviceData.lastServerConnectionConfigId)
+diff --git a/plugins/db.js b/plugins/db.js
+index 538c432..c0acf6c 100644
+--- a/plugins/db.js
++++ b/plugins/db.js
+@@ -38,6 +38,10 @@ class DbService {
+   }
+ 
+   // Release Radar fork: home-network routing
++  setLocalAddress(localAddress) {
++    return AbsDatabase.setLocalAddress({ localAddress: localAddress || '' })
++  }
++
+   getServerRoute() {
+     return AbsDatabase.getServerRoute().catch(() => null)
+   }
+-- 
+2.45.2.windows.1
+

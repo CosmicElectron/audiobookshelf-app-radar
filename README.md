@@ -14,6 +14,20 @@ identity (the account, tokens, downloads and progress all keep it); the home add
 the phone can reach it and it proves to be the same server (same version, our token validates there), every
 request including the audio stream and downloads goes to it; when it stops answering, requests go back to the
 server address on their own, so the app works unchanged on the home Wi-Fi, on mobile data, and with a VPN.
+
+Patch 4 keeps streamed audio on the phone. Everything the player reads passes through a 768 MB on-disk cache
+(the index at the head of the file, the audio around the playhead), and a pre-buffer keeps one minute behind
+and ten minutes ahead of where the last book was paused, so the next start plays from the phone while the
+server is only asked for a session. The cache is keyed by file, not URL, so it survives new sessions, token
+refreshes and the home-network switch. It also writes playback diagnostics to Settings > Logs: audio focus
+and suppression, player and device volume, audio outputs coming and going, sink and decoder errors,
+underruns, and a heartbeat every five minutes while playing.
+
+It also keeps two positions per book the way Audible does. The phone records where it left each book; when
+a session starts at the synced position another device moved to, or when play is pressed after a longer
+pause and the server turns out to be ahead, playback continues from the synced position and the player's
+menu offers "This phone was at 3:12:08" to jump back (and the synced position to jump forward again).
+Both windows are cached, so either jump is instant. The pre-buffer stays off on metered networks.
 The patches are `patches/*.patch`.
 
 ## How it stays current
