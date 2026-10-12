@@ -1,0 +1,711 @@
+From 82f12852b49b2a698dffbf7faaac17fbef916adc Mon Sep 17 00:00:00 2001
+From: Release Radar <release-radar@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 15:33:03 +0800
+Subject: [PATCH 3/3] Home-network address: use the LAN when it answers, the
+ tunnel otherwise
+
+The server connection config keeps its address as the server's identity
+(config id, tokens, downloads, progress). An optional second address for
+the home network is only a route: a native ServerRoute object probes it
+(healthcheck, /status is Audiobookshelf with our version, /api/me with our
+token returns our own user id) on every network change, and an OkHttp
+interceptor on the shared client rewrites API, stream and download
+requests to it while it answers, retrying GET/HEAD once on the canonical
+address when it fails to connect. The JS layer follows the same route for
+its own requests and covers, with one retry. The live socket stays on the
+canonical address. New field on the account page; the stream rides out a
+switch with a more patient load-error policy.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt b/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt
+index b1bfac7..61b95c9 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt
+@@ -52,6 +52,7 @@ class MainActivity : BridgeActivity() {
+ 
+     super.onCreate(savedInstanceState)
+     Log.d(tag, "onCreate")
++    com.audiobookshelf.app.server.ServerRoute.start(applicationContext) // Release Radar fork
+ 
+     // Update the margins to handle edge-to-edge enforced in SDK 35
+     // See: https://developer.android.com/develop/ui/views/layout/edge-to-edge
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/data/DeviceClasses.kt b/android/app/src/main/java/com/audiobookshelf/app/data/DeviceClasses.kt
+index fc9beb5..112aeff 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/data/DeviceClasses.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/data/DeviceClasses.kt
+@@ -59,7 +59,9 @@ data class ServerConnectionConfig(
+         var userId: String,
+         var username: String,
+         var token: String,
+-        var customHeaders: Map<String, String>?
++        var customHeaders: Map<String, String>?,
++        // Release Radar fork: optional home-network address (transport only; `address` stays the identity)
++        var localAddress: String? = null
+ )
+ 
+ @JsonIgnoreProperties(ignoreUnknown = true)
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/managers/InternalDownloadManager.kt b/android/app/src/main/java/com/audiobookshelf/app/managers/InternalDownloadManager.kt
+index f9a2217..db21be8 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/managers/InternalDownloadManager.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/managers/InternalDownloadManager.kt
+@@ -195,6 +195,7 @@ class InternalDownloadManager(
+     val CONTENT_RANGE = Regex("bytes (\\d+)-(\\d+)/(\\d+|\\*)")
+     val client =
+             OkHttpClient.Builder()
++                    .addInterceptor(com.audiobookshelf.app.server.ServerRoute.interceptor) // Release Radar fork
+                     .connectTimeout(30, TimeUnit.SECONDS)
+                     .readTimeout(60, TimeUnit.SECONDS)
+                     .writeTimeout(60, TimeUnit.SECONDS)
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+index e23871e..1df22b5 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+@@ -242,6 +242,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     val connectivityManager =
+             getSystemService(ConnectivityManager::class.java) as ConnectivityManager
+     connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
++    com.audiobookshelf.app.server.ServerRoute.start(ctx) // Release Radar fork
+ 
+     DbManager.initialize(ctx)
+ 
+@@ -533,6 +534,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+         dataSourceFactory.setUserAgent(channelId)
+         mediaSource =
+                 ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
++                        .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(8)) // Release Radar fork: ride out a home<->tunnel switch
+                         .createMediaSource(mediaItems[0])
+       } else {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Playing HLS stream of item ${currentPlaybackSession?.mediaItemId}.")
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
+index 0964d47..f5824f8 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
+@@ -8,6 +8,7 @@ import com.audiobookshelf.app.data.*
+ import com.audiobookshelf.app.device.DeviceManager
+ import com.audiobookshelf.app.media.MediaEventManager
+ import com.audiobookshelf.app.server.ApiHandler
++import com.audiobookshelf.app.server.ServerRoute
+ import com.audiobookshelf.app.managers.SecureStorage
+ import com.fasterxml.jackson.core.json.JsonReadFeature
+ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+@@ -30,7 +31,7 @@ class AbsDatabase : Plugin() {
+   data class LocalMediaProgressPayload(val value:List<LocalMediaProgress>)
+   data class LocalLibraryItemsPayload(val value:List<LocalLibraryItem>)
+   data class LocalFoldersPayload(val value:List<LocalFolder>)
+-  data class ServerConnConfigPayload(val id:String?, val index:Int, val name:String?, val userId:String, val username:String, var version:String, val token:String, val refreshToken:String?, val address:String?, val customHeaders:Map<String,String>?)
++  data class ServerConnConfigPayload(val id:String?, val index:Int, val name:String?, val userId:String, val username:String, var version:String, val token:String, val refreshToken:String?, val address:String?, val customHeaders:Map<String,String>?, val localAddress:String? = null)
+ 
+   override fun load() {
+     mainActivity = (activity as MainActivity)
+@@ -145,7 +146,8 @@ class AbsDatabase : Plugin() {
+         }
+         Log.d(tag, "Refresh token secured = $hasRefreshToken")
+ 
+-        serverConnectionConfig = ServerConnectionConfig(sscId, sscIndex, "$serverAddress ($username)", serverAddress, serverVersion, userId, username, accessToken, serverConfigPayload.customHeaders)
++        serverConnectionConfig = ServerConnectionConfig(sscId, sscIndex, "$serverAddress ($username)", serverAddress, serverVersion, userId, username, accessToken, serverConfigPayload.customHeaders,
++                serverConfigPayload.localAddress?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() })
+ 
+         // Add and save
+         DeviceManager.deviceData.serverConnectionConfigs.add(serverConnectionConfig!!)
+@@ -162,6 +164,15 @@ class AbsDatabase : Plugin() {
+           shouldSave = true
+         }
+ 
++        // Release Radar fork: the home-network address (null = untouched, "" = cleared)
++        if (serverConfigPayload.localAddress != null) {
++          val cleaned = serverConfigPayload.localAddress.trim().trimEnd('/').takeIf { it.isNotEmpty() }
++          if (serverConnectionConfig?.localAddress != cleaned) {
++            serverConnectionConfig?.localAddress = cleaned
++            shouldSave = true
++          }
++        }
++
+         // Update refresh token if provided
+         if (!refreshToken.isNullOrEmpty()) {
+           val stored = secureStorage.storeRefreshToken(serverConnectionConfig!!.id, refreshToken)
+@@ -178,10 +189,23 @@ class AbsDatabase : Plugin() {
+       }
+ 
+       DeviceManager.serverConnectionConfig = serverConnectionConfig
++      ServerRoute.probe("config set", force = true)
+       call.resolve(JSObject(jacksonMapper.writeValueAsString(DeviceManager.serverConnectionConfig)))
+     }
+   }
+ 
++  // Release Radar fork: which address the app is talking to right now
++  @PluginMethod
++  fun getServerRoute(call:PluginCall) {
++    call.resolve(ServerRoute.state())
++  }
++
++  @PluginMethod
++  fun probeServerRoute(call:PluginCall) {
++    ServerRoute.probe("js", force = true)
++    call.resolve(ServerRoute.state())
++  }
++
+   @PluginMethod
+   fun removeServerConnectionConfig(call:PluginCall) {
+     GlobalScope.launch(Dispatchers.IO) {
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt b/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
+index 2ddf832..4c32734 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
+@@ -49,7 +49,7 @@ object AbsHttp {
+       return all.filter { it is Inet4Address } + all.filter { it !is Inet4Address }
+     }
+   }
+-  val client: OkHttpClient = OkHttpClient.Builder().dns(dns).build()
++  val client: OkHttpClient = OkHttpClient.Builder().dns(dns).addInterceptor(ServerRoute.interceptor).build()
+ }
+ 
+ class ApiHandler(var ctx:Context) {
+@@ -58,6 +58,9 @@ class ApiHandler(var ctx:Context) {
+   companion object {
+     // For sending data back to the Webview frontend
+     lateinit var absDatabaseNotifyListeners:(String, JSObject) -> Unit
++    fun notifyJs(event: String, data: JSObject) {
++      if (::absDatabaseNotifyListeners.isInitialized) absDatabaseNotifyListeners(event, data)
++    }
+ 
+     fun checkAbsDatabaseNotifyListenersInitted():Boolean {
+       return ::absDatabaseNotifyListeners.isInitialized
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt b/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
+new file mode 100644
+index 0000000..2d8fbe6
+--- /dev/null
++++ b/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
+@@ -0,0 +1,219 @@
++package com.audiobookshelf.app.server
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.net.Network
++import android.net.NetworkCapabilities
++import android.util.Log
++import com.audiobookshelf.app.device.DeviceManager
++import com.getcapacitor.JSObject
++import okhttp3.Interceptor
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import org.json.JSONObject
++import java.io.IOException
++import java.util.concurrent.Executors
++import java.util.concurrent.ScheduledFuture
++import java.util.concurrent.TimeUnit
++
++/**
++ * Release Radar fork: one server, two addresses.
++ *
++ * The server connection config keeps its canonical address (the public
++ * tunnel) as the server's identity everywhere: config id, tokens, downloads,
++ * progress records. An optional home-network address is only a transport:
++ * while it answers, every HTTP request the app makes (API calls, progress
++ * sync, the audio stream, downloads) is rewritten to it by [interceptor]; the
++ * moment it stops answering the next request goes back to the canonical
++ * address on its own. The live socket stays on the canonical address.
++ *
++ * The home address is trusted only after it has proved to be the same server:
++ * /healthcheck answers, /status is Audiobookshelf, and /api/me with our token
++ * returns our own user id (a different server cannot validate our token).
++ */
++object ServerRoute {
++  private const val tag = "ServerRoute"
++  private const val CONNECT_MS = 1500L
++  private const val DOWN_HOLD_MS = 30_000L
++  private const val PROBE_MIN_GAP_MS = 10_000L
++
++  @Volatile var lanOk = false
++    private set
++  @Volatile private var verifiedLocal: String? = null
++  @Volatile private var downUntil = 0L
++  @Volatile private var lastProbeAt = 0L
++  @Volatile private var started = false
++  private val executor = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "server-route").apply { isDaemon = true } }
++  @Volatile private var pending: ScheduledFuture<*>? = null
++
++  private val probeClient: OkHttpClient by lazy {
++    OkHttpClient.Builder()
++      .dns(AbsHttp.dns)
++      .connectTimeout(CONNECT_MS, TimeUnit.MILLISECONDS)
++      .readTimeout(2500, TimeUnit.MILLISECONDS)
++      .callTimeout(5000, TimeUnit.MILLISECONDS)
++      .retryOnConnectionFailure(false)
++      .build()
++  }
++
++  val canonical: String? get() = DeviceManager.serverConnectionConfig?.address?.trimEnd('/')?.takeIf { it.isNotEmpty() }
++  val local: String? get() {
++    val l = DeviceManager.serverConnectionConfig?.localAddress?.trim()?.trimEnd('/') ?: return null
++    return if (l.isEmpty() || l == canonical) null else l
++  }
++
++  fun isLocal(): Boolean = lanOk && local != null
++  fun active(): String? = if (isLocal()) local else canonical
++
++  fun state(): JSObject {
++    val o = JSObject()
++    o.put("isLocal", isLocal())
++    o.put("active", active() ?: "")
++    o.put("canonical", canonical ?: "")
++    o.put("localAddress", local ?: "")
++    return o
++  }
++
++  /** Canonical <-> home prefix swap for one URL, according to the current state. */
++  fun rewrite(url: String): String {
++    val c = canonical ?: return url
++    val l = local ?: return url
++    return if (lanOk) {
++      if (url.startsWith("$c/") || url == c) l + url.substring(c.length) else url
++    } else {
++      if (url.startsWith("$l/") || url == l) c + url.substring(l.length) else url
++    }
++  }
++
++  private fun toCanonical(url: String): String {
++    val c = canonical ?: return url
++    val l = local ?: return url
++    return if (url.startsWith("$l/") || url == l) c + url.substring(l.length) else url
++  }
++
++  fun markDown(why: String) {
++    val was = lanOk
++    lanOk = false
++    downUntil = System.currentTimeMillis() + DOWN_HOLD_MS
++    if (was) {
++      Log.i(tag, "home address off: $why")
++      notifyJs()
++    }
++  }
++
++  private fun markUp() {
++    if (!lanOk) {
++      lanOk = true
++      Log.i(tag, "home address on: ${local}")
++      notifyJs()
++    }
++  }
++
++  private fun notifyJs() {
++    try {
++      ApiHandler.notifyJs("onServerRouteChanged", state())
++    } catch (e: Exception) {
++      Log.w(tag, "notify failed: ${e.message}")
++    }
++  }
++
++  /** Probe soon, coalescing bursts of network events. */
++  fun probeSoon(reason: String, delayMs: Long = 1500) {
++    pending?.cancel(false)
++    pending = executor.schedule({ probe(reason, force = false) }, delayMs, TimeUnit.MILLISECONDS)
++  }
++
++  /** Probe now on the route thread (never on the caller's thread). */
++  fun probe(reason: String, force: Boolean) {
++    executor.execute {
++      try {
++        val now = System.currentTimeMillis()
++        if (local == null) { if (lanOk) markDown("no home address"); return@execute }
++        if (!force && now < downUntil) return@execute
++        if (!force && now - lastProbeAt < PROBE_MIN_GAP_MS && lanOk) return@execute
++        lastProbeAt = now
++        val ok = try { sameServerReachable() } catch (e: Exception) { Log.d(tag, "probe ($reason): ${e.javaClass.simpleName} ${e.message}"); false }
++        if (ok) markUp() else markDown("probe ($reason) failed")
++      } catch (e: Exception) {
++        Log.w(tag, "probe error: ${e.message}")
++      }
++    }
++  }
++
++  private fun get(url: String, token: String? = null): Response {
++    val b = Request.Builder().url(url)
++    if (token != null) b.addHeader("Authorization", "Bearer $token")
++    return probeClient.newCall(b.build()).execute()
++  }
++
++  private fun sameServerReachable(): Boolean {
++    val l = local ?: return false
++    val cfg = DeviceManager.serverConnectionConfig ?: return false
++    get("$l/healthcheck").use { if (!it.isSuccessful) return false }
++    if (verifiedLocal == l) return true
++    // the same server, proven before the token is ever sent there
++    get("$l/status").use { r ->
++      if (!r.isSuccessful) return false
++      val j = JSONObject(r.body?.string() ?: return false)
++      if (j.optString("app") != "audiobookshelf") return false
++      val ver = j.optString("serverVersion")
++      val want = cfg.version
++      if (!want.isNullOrEmpty() && ver.isNotEmpty() && ver != want) {
++        Log.i(tag, "home address runs $ver, our server is $want: not the same server")
++        return false
++      }
++    }
++    get("$l/api/me", cfg.token).use { r ->
++      if (r.code != 200) return false
++      val j = JSONObject(r.body?.string() ?: return false)
++      if (j.optString("id") != cfg.userId) return false
++    }
++    verifiedLocal = l
++    return true
++  }
++
++  /** Register the default-network callback once per process. */
++  @Synchronized
++  fun start(ctx: Context) {
++    if (started) return
++    started = true
++    try {
++      val cm = ctx.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
++      cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
++        override fun onAvailable(network: Network) { probeSoon("network available") }
++        override fun onLost(network: Network) { markDown("network lost"); probeSoon("network lost", 3000) }
++        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
++          // Wi-Fi <-> cellular hand-over: re-check straight away
++          probeSoon("network changed")
++        }
++      })
++    } catch (e: Exception) {
++      Log.w(tag, "could not register network callback: ${e.message}")
++    }
++    probeSoon("start", 500)
++  }
++
++  /**
++   * Installed on the shared OkHttp client (API, player, downloads). A request
++   * for the canonical address goes to the home address while that is up;
++   * if the home address fails to connect, the request is retried once on the
++   * canonical address and the home address is held off for a while.
++   */
++  val interceptor = Interceptor { chain ->
++    val original = chain.request()
++    val url = original.url.toString()
++    val routed = rewrite(url)
++    val viaLocal = routed != url && lanOk && local != null && routed.startsWith(local!!)
++    val request = if (routed == url) original else original.newBuilder().url(routed).build()
++    if (!viaLocal) return@Interceptor chain.proceed(request)
++    try {
++      chain.withConnectTimeout(CONNECT_MS.toInt(), TimeUnit.MILLISECONDS).proceed(request)
++    } catch (e: IOException) {
++      markDown("request failed: ${e.javaClass.simpleName}")
++      val idempotent = original.method == "GET" || original.method == "HEAD"
++      if (!idempotent) throw e
++      chain.proceed(original.newBuilder().url(toCanonical(url)).build())
++    }
++  }
++}
+diff --git a/layouts/default.vue b/layouts/default.vue
+index f7ea388..113266f 100644
+--- a/layouts/default.vue
++++ b/layouts/default.vue
+@@ -16,7 +16,7 @@
+ 
+ <script>
+ import { CapacitorHttp } from '@capacitor/core'
+-import { AbsLogger } from '@/plugins/capacitor'
++import { AbsLogger, AbsDatabase } from '@/plugins/capacitor'
+ 
+ export default {
+   data() {
+@@ -206,6 +206,7 @@ export default {
+       this.$store.commit('user/setUser', user)
+       this.$store.commit('user/setAccessToken', serverConnectionConfig.token)
+       this.$store.commit('user/setServerConnectionConfig', serverConnectionConfig)
++      this.refreshServerRoute()
+ 
+       this.$socket.connect(serverConnectionConfig.address, serverConnectionConfig.token)
+ 
+@@ -323,8 +324,17 @@ export default {
+         this.$store.commit('globals/updateLocalMediaProgress', newLocalMediaProgress)
+       }
+     },
++    // Release Radar fork: which address requests go to (home network while it answers)
++    applyServerRoute(route) {
++      this.$store.commit('user/setActiveServerAddress', route && route.isLocal ? route.active : null)
++    },
++    async refreshServerRoute() {
++      const route = await this.$db.getServerRoute()
++      if (route) this.applyServerRoute(route)
++    },
+     async visibilityChanged() {
+       if (document.visibilityState === 'visible') {
++        this.$db.probeServerRoute().then((route) => route && this.applyServerRoute(route))
+         const elapsedTimeOutOfFocus = Date.now() - this.timeLostFocus
+         console.log(`✅ [default] device visibility: has focus (${elapsedTimeOutOfFocus}ms out of focus)`)
+         // If device out of focus for more than 30s then reload local media progress
+@@ -351,6 +361,7 @@ export default {
+   async mounted() {
+     this.$eventBus.$on('change-lang', this.changeLanguage)
+     document.addEventListener('visibilitychange', this.visibilityChanged)
++    this.serverRouteListener = await AbsDatabase.addListener('onServerRouteChanged', this.applyServerRoute).catch(() => null)
+ 
+     this.$socket.on('user_updated', this.userUpdated)
+     this.$socket.on('user_media_progress_updated', this.userMediaProgressUpdated)
+@@ -367,6 +378,7 @@ export default {
+       this.$setOrientationLock(this.$store.getters['getOrientationLockSetting'])
+ 
+       await this.$store.dispatch('setupNetworkListener')
++      this.refreshServerRoute()
+ 
+       if (this.$store.state.user.serverConnectionConfig) {
+         AbsLogger.info({ tag: 'default', message: `mounted: Server connected, init libraries (${this.$store.getters['user/getServerConfigName']})` })
+@@ -387,6 +399,7 @@ export default {
+   beforeDestroy() {
+     this.$eventBus.$off('change-lang', this.changeLanguage)
+     document.removeEventListener('visibilitychange', this.visibilityChanged)
++    if (this.serverRouteListener) this.serverRouteListener.remove()
+     this.$socket.off('user_updated', this.userUpdated)
+     this.$socket.off('user_media_progress_updated', this.userMediaProgressUpdated)
+   }
+diff --git a/pages/account.vue b/pages/account.vue
+index 1e78594..d3fc0d5 100644
+--- a/pages/account.vue
++++ b/pages/account.vue
+@@ -4,6 +4,13 @@
+ 
+     <ui-text-input-with-label :value="username" :label="$strings.LabelUsername" disabled class="my-2" />
+ 
++    <!-- Release Radar fork: a second address for the same server, used while the phone can reach it -->
++    <ui-text-input-with-label v-model="localAddress" label="Home network address" placeholder="http://192.168.x.x:13378 (optional)" :autofocus="false" class="my-2" />
++    <div class="flex items-center">
++      <p class="text-xs text-fg-muted flex-grow pr-2">{{ routeText }}</p>
++      <ui-btn small :disabled="!localAddressChanged" @click="saveLocalAddress">Save</ui-btn>
++    </div>
++
+     <div v-if="serverVersion" class="text-sm text-fg">
+       <p>Server version: v{{ serverVersion }}</p>
+     </div>
+@@ -32,9 +39,21 @@ export default {
+     return {}
+   },
+   data() {
+-    return {}
++    return {
++      localAddress: ''
++    }
+   },
+   computed: {
++    savedLocalAddress() {
++      return this.serverConnectionConfig.localAddress || ''
++    },
++    localAddressChanged() {
++      return this.cleanAddress(this.localAddress) !== this.savedLocalAddress
++    },
++    routeText() {
++      if (!this.savedLocalAddress) return 'Requests go to the server address. Add the address the server has on your home network and the app will use it whenever it answers, the server address otherwise.'
++      return this.$store.state.user.activeServerAddress ? 'Connected through the home network.' : 'Home network not reachable, using the server address.'
++    },
+     username() {
+       if (!this.user) return ''
+       return this.user.username
+@@ -54,12 +73,35 @@ export default {
+     }
+   },
+   methods: {
++    cleanAddress(value) {
++      return (value || '').trim().replace(/\/+$/, '')
++    },
++    async saveLocalAddress() {
++      const cleaned = this.cleanAddress(this.localAddress)
++      if (cleaned && !/^https?:\/\/\S+$/i.test(cleaned)) {
++        this.$toast.error('Start the address with http:// or https://')
++        return
++      }
++      await this.$hapticsImpact()
++      const config = await this.$db.setServerConnectionConfig({ ...this.serverConnectionConfig, localAddress: cleaned }).catch((error) => {
++        console.error('Failed to save home network address', error)
++        this.$toast.error('Could not save the address')
++        return null
++      })
++      if (!config) return
++      this.$store.commit('user/setServerConnectionConfig', config)
++      this.localAddress = config.localAddress || ''
++      if (!cleaned) this.$store.commit('user/setActiveServerAddress', null)
++      this.$db.probeServerRoute()
++    },
+     async logout() {
+       await this.$hapticsImpact()
+       await this.$store.dispatch('user/logout')
+       this.$router.push('/connect')
+     }
+   },
+-  mounted() {}
++  mounted() {
++    this.localAddress = this.savedLocalAddress
++  }
+ }
+ </script>
+diff --git a/plugins/axios.js b/plugins/axios.js
+index de50a8d..9680159 100644
+--- a/plugins/axios.js
++++ b/plugins/axios.js
+@@ -52,7 +52,7 @@ export default function ({ $axios, store, $db }) {
+       console.warn('[Axios] No Bearer Token for request')
+     }
+ 
+-    const serverUrl = store.getters['user/getServerAddress']
++    const serverUrl = store.getters['user/getServerRequestAddress'] // Release Radar fork: home network when reachable
+     if (serverUrl) {
+       config.url = `${serverUrl}${config.url}`
+     }
+diff --git a/plugins/capacitor/AbsDatabase.js b/plugins/capacitor/AbsDatabase.js
+index 58a2e30..fafceb0 100644
+--- a/plugins/capacitor/AbsDatabase.js
++++ b/plugins/capacitor/AbsDatabase.js
+@@ -49,6 +49,7 @@ class AbsDatabaseWeb extends WebPlugin {
+       ssc.username = serverConnectionConfig.username
+       ssc.version = serverConnectionConfig.version
+       ssc.customHeaders = serverConnectionConfig.customHeaders || {}
++      if (serverConnectionConfig.localAddress != null) ssc.localAddress = serverConnectionConfig.localAddress || null
+ 
+       if (serverConnectionConfig.refreshToken) {
+         console.log('[AbsDatabase] Updating refresh token...')
+@@ -67,7 +68,8 @@ class AbsDatabaseWeb extends WebPlugin {
+         address: serverConnectionConfig.address,
+         token: serverConnectionConfig.token,
+         version: serverConnectionConfig.version,
+-        customHeaders: serverConnectionConfig.customHeaders || {}
++        customHeaders: serverConnectionConfig.customHeaders || {},
++        localAddress: serverConnectionConfig.localAddress || null
+       }
+ 
+       if (serverConnectionConfig.refreshToken) {
+@@ -83,6 +85,16 @@ class AbsDatabaseWeb extends WebPlugin {
+     return ssc
+   }
+ 
++  async getServerRoute() {
++    const deviceData = await this.getDeviceData()
++    const ssc = deviceData.serverConnectionConfigs.find((c) => c.id == deviceData.lastServerConnectionConfigId)
++    return { isLocal: false, active: ssc?.address || '', canonical: ssc?.address || '', localAddress: ssc?.localAddress || '' }
++  }
++
++  async probeServerRoute() {
++    return this.getServerRoute()
++  }
++
+   async getRefreshToken({ serverConnectionConfigId }) {
+     console.log('[AbsDatabase] Getting refresh token...', serverConnectionConfigId)
+     const refreshToken = localStorage.getItem(`refresh_token_${serverConnectionConfigId}`)
+diff --git a/plugins/db.js b/plugins/db.js
+index 5005758..538c432 100644
+--- a/plugins/db.js
++++ b/plugins/db.js
+@@ -37,6 +37,15 @@ class DbService {
+     })
+   }
+ 
++  // Release Radar fork: home-network routing
++  getServerRoute() {
++    return AbsDatabase.getServerRoute().catch(() => null)
++  }
++
++  probeServerRoute() {
++    return AbsDatabase.probeServerRoute().catch(() => null)
++  }
++
+   removeServerConnectionConfig(serverConnectionConfigId) {
+     return AbsDatabase.removeServerConnectionConfig({ serverConnectionConfigId }).then((data) => {
+       console.log('Removed server connection config', serverConnectionConfigId)
+diff --git a/plugins/nativeHttp.js b/plugins/nativeHttp.js
+index aced76e..f634b7c 100644
+--- a/plugins/nativeHttp.js
++++ b/plugins/nativeHttp.js
+@@ -17,7 +17,9 @@ export default function ({ store, $db, $socket }, inject) {
+           console.warn('[nativeHttp] No Bearer Token for request')
+         }
+         if (serverConnectionConfig?.address) {
+-          url = `${serverConnectionConfig.address}${url}`
++          // Release Radar fork: the home-network address while it answers
++          const base = options.serverConnectionConfig ? serverConnectionConfig.address : store.getters['user/getServerRequestAddress'] || serverConnectionConfig.address
++          url = `${base}${url}`
+         }
+       }
+       if (data) {
+@@ -29,12 +31,23 @@ export default function ({ store, $db, $socket }, inject) {
+       }
+       console.log(`[nativeHttp] Making ${method} request to ${url}`)
+ 
++      const activeLocal = store.state.user.activeServerAddress
++      const viaLocal = !!activeLocal && url.startsWith(activeLocal)
+       return CapacitorHttp.request({
+         method,
+         url,
+         data,
+         headers,
+         ...options
++      }).catch((err) => {
++        // Release Radar fork: the home address stopped answering mid-way - fall back to the tunnel once
++        if (!viaLocal) throw err
++        console.warn('[nativeHttp] home address failed, retrying via the canonical address', err?.message)
++        store.commit('user/setActiveServerAddress', null)
++        $db.probeServerRoute()
++        const canonical = store.state.user.serverConnectionConfig?.address
++        if (!canonical) throw err
++        return CapacitorHttp.request({ method, url: canonical + url.substring(activeLocal.length), data, headers, ...options })
+       }).then((res) => {
+         if (res.status === 401) {
+           console.error(`[nativeHttp] 401 status for url "${url}"`)
+diff --git a/store/globals.js b/store/globals.js
+index 6edad56..e5e8395 100644
+--- a/store/globals.js
++++ b/store/globals.js
+@@ -37,7 +37,7 @@ export const getters = {
+       // Absolute URL covers (should no longer be used)
+       if (media.coverPath.startsWith('http:') || media.coverPath.startsWith('https:')) return media.coverPath
+ 
+-      const serverAddress = rootGetters['user/getServerAddress']
++      const serverAddress = rootGetters['user/getServerRequestAddress'] // Release Radar fork
+       if (!serverAddress) return placeholder
+ 
+       const lastUpdate = libraryItem.updatedAt || Date.now()
+@@ -61,7 +61,7 @@ export const getters = {
+     (libraryItemId, placeholder = null) => {
+       if (!placeholder) placeholder = `${rootState.routerBasePath}/book_placeholder.jpg`
+       if (!libraryItemId) return placeholder
+-      const serverAddress = rootGetters['user/getServerAddress']
++      const serverAddress = rootGetters['user/getServerRequestAddress'] // Release Radar fork
+       if (!serverAddress) return placeholder
+ 
+       const url = new URL(`${serverAddress}/api/items/${libraryItemId}/cover`)
+diff --git a/store/user.js b/store/user.js
+index e476514..3c63d32 100644
+--- a/store/user.js
++++ b/store/user.js
+@@ -6,6 +6,7 @@ export const state = () => ({
+   user: null,
+   accessToken: null,
+   serverConnectionConfig: null,
++  activeServerAddress: null, // Release Radar fork: the home-network address while it answers, else null
+   settings: {
+     mobileOrderBy: 'addedAt',
+     mobileOrderDesc: true,
+@@ -31,6 +32,10 @@ export const getters = {
+   getServerAddress: (state) => {
+     return state.serverConnectionConfig?.address || null
+   },
++  // the address to SEND requests to (home network when reachable); identity checks keep getServerAddress
++  getServerRequestAddress: (state) => {
++    return state.activeServerAddress || state.serverConnectionConfig?.address || null
++  },
+   getServerConfigName: (state) => {
+     return state.serverConnectionConfig?.name || null
+   },
+@@ -250,8 +255,12 @@ export const mutations = {
+     }
+   },
+   setServerConnectionConfig(state, serverConnectionConfig) {
++    if (serverConnectionConfig?.id !== state.serverConnectionConfig?.id) state.activeServerAddress = null
+     state.serverConnectionConfig = serverConnectionConfig
+   },
++  setActiveServerAddress(state, address) {
++    state.activeServerAddress = address || null
++  },
+   setSettings(state, settings) {
+     if (!settings) return
+     state.settings = settings
+-- 
+2.45.2.windows.1
+
