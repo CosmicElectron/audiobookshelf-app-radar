@@ -3,6 +3,8 @@
 The official [Audiobookshelf Android app](https://github.com/advplyr/audiobookshelf-app), rebuilt from every
 upstream release with one set of changes on top. The changes make the app behave well on a self-hosted server
 reached through a tunnel, on a home network, in the car, and alongside other devices listening to the same books.
+It is the companion of [Release Radar](https://github.com/CosmicElectron/Audiobook-Radar), which tracks the
+series you follow and files the books.
 
 ## What is different
 
@@ -29,8 +31,9 @@ reach it and it proves to be the same server (same version, your token validates
 the audio stream and downloads goes to it; when it stops answering, requests go back to the server address on
 their own. Wi-Fi, mobile data and VPN switches re-prove the address at once.
 
-**Series descriptions on the series page**, which the server stores but no client shows. Release Radar writes
-its one-line status there ("Audio 2 overdue by 10 days", "Audiobook 3 Nov").
+**Series descriptions on the series page**, which the server stores but no client shows.
+[Release Radar](https://github.com/CosmicElectron/Audiobook-Radar), the release tracker this app is built to work
+with, writes its one-line status there ("Audio 2 overdue by 10 days", "Audiobook 3 Nov").
 
 **Listening sessions in the player** menu, for the current book only; tapping one continues from where that
 session ended, whichever device it was on.
