@@ -1,63 +1,70 @@
-# Audiobookshelf app, with series descriptions
+# Audiobookshelf app, plus
 
-The official [Audiobookshelf Android app](https://github.com/advplyr/audiobookshelf-app) plus one small patch:
-the series page shows the series' description, which the server stores but no client displays. Release Radar
-writes a one-line status there ("Audio 2 overdue by 10 days", "Audiobook 3 Nov", "Audio 6 est. 13 Feb 2027").
+The official [Audiobookshelf Android app](https://github.com/advplyr/audiobookshelf-app), rebuilt from every
+upstream release with one set of changes on top. The changes make the app behave well on a self-hosted server
+reached through a tunnel, on a home network, in the car, and alongside other devices listening to the same books.
 
-Patch 2 makes streaming over a tunnel bearable: a 60 s back buffer so the auto-rewind after a pause plays from
-memory, a 5 s rebuffer threshold, one shared HTTP client that tries IPv4 before IPv6 (a VPN with non-routing
-IPv6 used to stall every connection), a VPN counted as a network, and a "Listening sessions" entry in the
-player's menu listing the server's sessions for the current book.
+## What is different
 
-Patch 3 adds a "Home network address" field on the account page. The server address stays the server's
-identity (the account, tokens, downloads and progress all keep it); the home address is only a route. While
-the phone can reach it and it proves to be the same server (same version, our token validates there), every
-request including the audio stream and downloads goes to it; when it stops answering, requests go back to the
-server address on their own, so the app works unchanged on the home Wi-Fi, on mobile data, and with a VPN.
+**It starts from the phone.** Everything the player reads for a streamed book goes through an on-disk cache
+(768 MB), so the last book's index and the audio around your position are already on the phone. The home page
+shows the shelves the server sent last time while the connection is still being made, with covers, and a tap
+starts the book. Android Auto answers at once with the cached Continue list. Tapping the last book reuses its
+session and the cached audio instead of waiting for the server. Every streamed book plays from the library files
+with the current token, so a session the server dropped, or a refreshed token, cannot break a stream.
 
-Patch 4 keeps streamed audio on the phone. Everything the player reads passes through a 768 MB on-disk cache
-(the index at the head of the file, the audio around the playhead), and a pre-buffer keeps one minute behind
-and ten minutes ahead of where the last book was paused, so the next start plays from the phone while the
-server is only asked for a session. The cache is keyed by file, not URL, so it survives new sessions, token
-refreshes and the home-network switch. It also writes playback diagnostics to Settings > Logs: audio focus
-and suppression, player and device volume, audio outputs coming and going, sink and decoder errors,
-underruns, and a heartbeat every five minutes while playing.
+**Positions follow the listener, not the device.** The phone records where it left each book. When a session
+starts at the position another device moved to, or play is pressed after a longer pause, the server is asked
+where the book is, and asked again until it answers; until then the phone holds its own progress syncs, so an
+older position never overwrites one set later elsewhere. The server wins only when it holds a position this
+phone never got it to accept, and a book finished elsewhere starts over. Both positions stay one tap away: a
+single tappable notice, "This phone was at …" in the player menu, and a button on the car screen.
 
-It also keeps two positions per book the way Audible does. The phone records where it left each book; when
-a session starts at the synced position another device moved to, or when play is pressed after a longer
-pause and the server turns out to be ahead, playback continues from the synced position and the player's
-menu offers "This phone was at 3:12:08" to jump back (and the synced position to jump forward again).
-Both windows are cached, so either jump is instant. The pre-buffer stays off on metered networks.
+**Streaming over a tunnel is smooth.** A sixty-second back buffer, so the rewind after a pause plays from memory;
+ten minutes of look-ahead on disk; a five-second rebuffer threshold; one shared HTTP client that tries IPv4 before
+IPv6 (a VPN with non-routing IPv6 used to stall every connection); a VPN counted as a network.
 
-Patch 5 makes the last book start from the phone without waiting for the server. The home page shows the
-shelves the server sent last time while the connection is still being made, Android Auto answers at once
-with the cached "Continue" list, and tapping the last book reuses its session and the cached audio. The
-server is then asked where the book is, and asked again every ten seconds until it answers; until then the
-phone holds its own progress syncs, so an older position never overwrites one another device set later.
-The server wins only when it holds a position this phone never sent. If the server dropped the session, a
-new one is fetched on the first failed sync and playback carries on; the pre-buffer falls back to the
-library file itself. The notification's own play button takes the same path on older Android versions.
-The patches are `patches/*.patch`.
+**A home-network address.** The account page takes a second address for the same server. While the phone can
+reach it and it proves to be the same server (same version, your token validates there), every request including
+the audio stream and downloads goes to it; when it stops answering, requests go back to the server address on
+their own. Wi-Fi, mobile data and VPN switches re-prove the address at once.
+
+**Series descriptions on the series page**, which the server stores but no client shows. Release Radar writes
+its one-line status there ("Audio 2 overdue by 10 days", "Audiobook 3 Nov").
+
+**Listening sessions in the player** menu, for the current book only; tapping one continues from where that
+session ended, whichever device it was on.
+
+**Diagnostics on the Logs page**: audio focus and suppression, player and device volume, the audio route and
+outputs coming and going, sink and decoder errors, underruns, a heartbeat while playing, and a crash's stack
+trace for the next launch.
 
 ## How it stays current
 
-A GitHub Actions workflow checks upstream's releases once a day. For a new tag it applies the patch on top of
-that tag, builds a release APK, signs it with this repository's key, and publishes `audiobookshelf-series.apk`
-as release `v<upstream version>-sd<PATCH_REV>`. If the patch ever stops applying, the run fails and nothing
-is published.
+A GitHub Actions workflow checks upstream's releases once a day. For a new tag it applies the changes
+(`patches/*.patch`) on top of that tag, builds a release APK, signs it with this repository's key, and publishes
+`audiobookshelf-plus.apk` as release `v<upstream version>-sd<PATCH_REV>`. If the changes ever stop applying, the
+run fails and nothing is published.
 
-Point [Obtainium](https://github.com/ImranR98/Obtainium) at this repository. Releases here are normal
-releases, so no prerelease setting is needed.
+Point [Obtainium](https://github.com/ImranR98/Obtainium) at this repository. Releases are normal releases; the
+pre-releases are test builds and need "Include prereleases" to be seen.
 
 ## Installing over the official app
 
-This build is signed with a different key from the official one, so Android will not update one over the
-other. Uninstall the official app once, install this one, and sign in again. Listening progress lives on the
-server. Books downloaded to the phone must be downloaded again.
+This build is signed with a different key from the official one, so Android will not update one over the other.
+Uninstall the official app once, install this one, and sign in again. Listening progress lives on the server.
+Books downloaded to the phone must be downloaded again.
 
-Android Auto hides sideloaded media apps. To see this one in the car: Android Auto settings, tap the Version
-entry about ten times to enable developer settings, open the menu, Developer settings, turn on "Unknown
-sources", then reconnect.
+Android Auto hides sideloaded media apps. To see this one in the car: Android Auto settings, tap the Version entry
+about ten times to enable developer settings, open the menu, Developer settings, turn on "Unknown sources", then
+reconnect.
+
+## Settings worth knowing
+
+- Account page, "Home network address": the server's address on your home network, with the same base path as
+  the server address. Leave it empty to always use the server address.
+- The pre-buffer stays off on mobile data; the player's own look-ahead does not.
+- Settings > Logs: the diagnostics; "Mask server address" hides your hosts when sharing them.
 
 ## Secrets the workflow needs
 
@@ -66,5 +73,5 @@ Keep an offline copy of the keystore: losing it means another uninstall for ever
 
 ## Retiring this
 
-When upstream shows series descriptions itself, or when its client is rewritten, drop the patch and point
-Obtainium back at upstream.
+When upstream covers these things itself, or when its client is rewritten, drop the patches and point Obtainium
+back at upstream.
