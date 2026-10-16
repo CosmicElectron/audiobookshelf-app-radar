@@ -1,7 +1,8 @@
-# Audiobookshelf app, plus
+# Audiobookshelf app, the Release Radar build
 
 The official [Audiobookshelf Android app](https://github.com/advplyr/audiobookshelf-app), rebuilt from every
-upstream release with one set of changes on top. The changes make the app behave well on a self-hosted server
+upstream release with one set of changes on top. (Not to be confused with
+[Audiobookshelf+](https://github.com/ADD-OCD/audiobookshelfplus-app), a separate fork with its own changes.) The changes make the app behave well on a self-hosted server
 reached through a tunnel, on a home network, in the car, and alongside other devices listening to the same books.
 It is the companion of [Release Radar](https://github.com/CosmicElectron/Audiobook-Radar), which tracks the
 series you follow and files the books.
@@ -46,7 +47,7 @@ trace for the next launch.
 
 A GitHub Actions workflow checks upstream's releases once a day. For a new tag it applies the changes
 (`patches/*.patch`) on top of that tag, builds a release APK, signs it with this repository's key, and publishes
-`audiobookshelf-plus.apk` as release `v<upstream version>-sd<PATCH_REV>`. If the changes ever stop applying, the
+`audiobookshelf-radar.apk` as release `v<upstream version>-sd<PATCH_REV>`. If the changes ever stop applying, the
 run fails and nothing is published.
 
 Point [Obtainium](https://github.com/ImranR98/Obtainium) at this repository. Releases are normal releases; the

@@ -136,9 +136,9 @@ jobs:
           UNSIGNED=src/android/app/build/outputs/apk/release/app-release-unsigned.apk
           "$BT/zipalign" -p -f 4 "$UNSIGNED" aligned.apk
           "$BT/apksigner" sign --ks "$RUNNER_TEMP/keystore.jks" --ks-pass env:KEYSTORE_PASSWORD \
-            --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD --out audiobookshelf-plus.apk aligned.apk
-          "$BT/apksigner" verify --print-certs audiobookshelf-plus.apk
-          sha256sum audiobookshelf-plus.apk | tee SHA256SUMS.txt
+            --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD --out audiobookshelf-radar.apk aligned.apk
+          "$BT/apksigner" verify --print-certs audiobookshelf-radar.apk
+          sha256sum audiobookshelf-radar.apk | tee SHA256SUMS.txt
           rm -f "$RUNNER_TEMP/keystore.jks"
 
       - name: Publish the release
@@ -148,10 +148,10 @@ jobs:
           VER="${{ steps.ver.outputs.ver }}"
           TAG="${{ steps.ver.outputs.tag }}"
           SHA=$(git -C src rev-parse --short HEAD~1)
-          NOTES=$(printf 'Upstream %s %s (%s) + patches at %s.\n\n%s\n\nThe official app plus: starts from the phone (cached home shelves, Android Auto list, session and audio), positions that follow the listener across devices with the way back one tap away, smooth streaming over a tunnel, a home-network address, series descriptions, listening sessions in the player, and diagnostics on the Logs page. Details in the README.' \
+          NOTES=$(printf 'Upstream %s %s (%s) + patches at %s.\n\n%s\n\nThe Release Radar build of the official app: starts from the phone (cached home shelves, Android Auto list, session and audio), positions that follow the listener across devices with the way back one tap away, smooth streaming over a tunnel, a home-network address, series descriptions, listening sessions in the player, and diagnostics on the Logs page. Details in the README.' \
                   "$UPSTREAM" "$TAG" "$SHA" "${GITHUB_SHA::7}" "$(cat SHA256SUMS.txt)")
           if gh release view "v$VER" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "v$VER" audiobookshelf-plus.apk SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
+            gh release upload "v$VER" audiobookshelf-radar.apk SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
           else
-            gh release create "v$VER" audiobookshelf-plus.apk SHA256SUMS.txt --target main --title "v$VER" --latest --notes "$NOTES" -R "$GITHUB_REPOSITORY"
+            gh release create "v$VER" audiobookshelf-radar.apk SHA256SUMS.txt --target main --title "v$VER" --latest --notes "$NOTES" -R "$GITHUB_REPOSITORY"
           fi
