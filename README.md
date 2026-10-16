@@ -28,6 +28,15 @@ a session starts at the synced position another device moved to, or when play is
 pause and the server turns out to be ahead, playback continues from the synced position and the player's
 menu offers "This phone was at 3:12:08" to jump back (and the synced position to jump forward again).
 Both windows are cached, so either jump is instant. The pre-buffer stays off on metered networks.
+
+Patch 5 makes the last book start from the phone without waiting for the server. The home page shows the
+shelves the server sent last time while the connection is still being made, Android Auto answers at once
+with the cached "Continue" list, and tapping the last book reuses its session and the cached audio. The
+server is then asked where the book is, and asked again every ten seconds until it answers; until then the
+phone holds its own progress syncs, so an older position never overwrites one another device set later.
+The server wins only when it holds a position this phone never sent. If the server dropped the session, a
+new one is fetched on the first failed sync and playback carries on; the pre-buffer falls back to the
+library file itself. The notification's own play button takes the same path on older Android versions.
 The patches are `patches/*.patch`.
 
 ## How it stays current
@@ -45,6 +54,10 @@ releases, so no prerelease setting is needed.
 This build is signed with a different key from the official one, so Android will not update one over the
 other. Uninstall the official app once, install this one, and sign in again. Listening progress lives on the
 server. Books downloaded to the phone must be downloaded again.
+
+Android Auto hides sideloaded media apps. To see this one in the car: Android Auto settings, tap the Version
+entry about ten times to enable developer settings, open the menu, Developer settings, turn on "Unknown
+sources", then reconnect.
 
 ## Secrets the workflow needs
 

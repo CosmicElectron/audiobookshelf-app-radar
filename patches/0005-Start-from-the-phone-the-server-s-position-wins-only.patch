@@ -1,0 +1,2406 @@
+From afb25a31f37ab687ebd1645e386f9e82ffd043b0 Mon Sep 17 00:00:00 2001
+From: Release Radar <release-radar@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:28:40 +0800
+Subject: [PATCH 5/5] Start from the phone; the server's position wins only
+ when another device set it
+
+The last book starts without the server: the home page shows the shelves
+the server sent last time while the connection is still being made (covers
+from the saved config, a tap starts the book), Android Auto answers at once
+with the cached Continue list, and tapping the last book reuses its session
+and the cached audio. Before the server has answered, the saved config
+stands in for the session it created.
+
+Every streamed book plays from the library files with the current token, so
+a session the server dropped, or a refreshed token, cannot break a stream;
+a dropped session is renewed on the first failed sync without touching the
+player.
+
+After a cached start, or play after a longer pause, the server is asked
+where the book is, and asked again until it answers; until then this phone
+holds its own progress syncs and does not save them for the web layer to
+upload. The server wins only when it holds a position this phone never got
+it to accept; a finished record never wins; a seek by the listener turns a
+jump into an offer. Both positions stay one tap away: a single tappable
+notice, the player menu, and a button on the car screen.
+
+Positions are recorded per book and episode; a finished book starts over;
+a position the reconcile only parked at is never recorded as this phone's.
+The pre-buffer learns the audio offset on any network and downloads windows
+on Wi-Fi only; the audio length comes from the mdat box. Home route: a
+network change re-proves the address at once, a probe that started on the
+old network is dropped, a failed probe retries with backoff, a token refresh
+re-proves it. A crash leaves its stack trace on the Logs page; log masking
+covers configured hosts with and without ports.
+
+Seven adversarial review rounds (41, 21, 16, 14, 13, 8 and 8 confirmed
+findings) plus a narrow check of the final edit are folded in. Known and
+left for the next patch: a sync the server applied without a reply can
+look like another device's move; a cast switch during an unanswered
+server check; re-tapping the playing book in the car drops the way back.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt b/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt
+index 61b95c9..38d620d 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/MainActivity.kt
+@@ -44,6 +44,8 @@ class MainActivity : BridgeActivity() {
+   public override fun onCreate(savedInstanceState: Bundle?) {
+     DbManager.initialize(applicationContext)
+ 
++    AbsLogger.installCrashHandler() // Release Radar fork: a crash leaves its stack trace on Settings > Logs
++
+     registerPlugin(AbsAudioPlayer::class.java)
+     registerPlugin(AbsDownloader::class.java)
+     registerPlugin(AbsFileSystem::class.java)
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/data/PlaybackSession.kt b/android/app/src/main/java/com/audiobookshelf/app/data/PlaybackSession.kt
+index 6caba55..3321e13 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/data/PlaybackSession.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/data/PlaybackSession.kt
+@@ -190,9 +190,30 @@ class PlaybackSession(
+     return Uri.parse("$serverAddress/api/items/$libraryItemId/cover?token=${DeviceManager.token}")
+   }
+ 
++  // Release Radar fork: a session restarted from the phone may be closed on the server, so its
++  // /public/session URLs can be dead; the library file itself serves the same bytes (same cache key)
++  @JsonIgnore
++  var useFileUrls: Boolean = false
++
++  @JsonIgnore
++  fun fileUri(audioTrack: AudioTrack): Uri? {
++    val base = serverAddress?.trimEnd('/') ?: return null
++    val itemId = libraryItemId ?: return null
++    val rel = audioTrack.metadata?.relPath ?: return null
++    val ino = when (val media = libraryItem?.media) {
++      is Book -> media.audioFiles?.firstOrNull { it.metadata.relPath == rel }?.ino
++      is Podcast -> media.episodes?.firstOrNull { it.audioFile?.metadata?.relPath == rel }?.audioFile?.ino
++      else -> null
++    } ?: return null
++    val token = DeviceManager.token
++    if (token.isEmpty()) return null
++    return Uri.parse("$base/api/items/$itemId/file/$ino?token=$token")
++  }
++
+   @JsonIgnore
+   fun getContentUri(audioTrack: AudioTrack): Uri {
+     if (isLocal) return Uri.parse(audioTrack.contentUrl) // Local content url
++    if (useFileUrls && isDirectPlay) fileUri(audioTrack)?.let { return it } // Release Radar fork
+     // As of v2.22.0 tracks use a different endpoint
+     // See: https://github.com/advplyr/audiobookshelf/pull/4263
+     if (checkIsServerVersionGte("2.22.0")) {
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt b/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt
+index cf77302..cc7e44d 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/device/DeviceManager.kt
+@@ -33,6 +33,20 @@ object DeviceManager {
+   var serverConnectionConfig: ServerConnectionConfig? = null
+ 
+   val serverConnectionConfigId get() = serverConnectionConfig?.id ?: ""
++
++  // Release Radar fork: before the server has answered (cold start, Android Auto, offline) adopt the saved
++  // config the last session was made with, so its address, token and version are known. Never after a
++  // logout: that clears lastServerConnectionConfigId. Returns true when the current config has [configId].
++  fun adoptSavedConfig(configId: String?): Boolean {
++    if (configId.isNullOrEmpty()) return false
++    if (serverConnectionConfig == null && configId == deviceData.lastServerConnectionConfigId) {
++      getServerConnectionConfig(configId)?.let {
++        serverConnectionConfig = it
++        com.audiobookshelf.app.server.ServerRoute.probe("config restored", force = true)
++      }
++    }
++    return serverConnectionConfigId == configId
++  }
+   val serverConnectionConfigName get() = serverConnectionConfig?.name ?: ""
+   val serverConnectionConfigString get() = serverConnectionConfig?.name ?: "No server connection"
+   val serverAddress
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt b/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt
+index dec2e31..ba24d31 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/media/MediaManager.kt
+@@ -58,6 +58,11 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+   private var isLoadingAndroidAutoItems = false
+   private val pendingAndroidAutoLoadCallbacks = mutableListOf<() -> Unit>()
+   private val androidAutoLoadLock = Any()
++  // Release Radar fork
++  private var itemsInProgressFromCache = false
++  private var earlyAnswerDone = false
++  var onFullLoadDone: (() -> Unit)? = null
++  var resumeLastSession: ((libraryItemId: String, episodeId: String?) -> PlaybackSession?)? = null
+ 
+   fun getIsLibrary(id:String) : Boolean {
+     return serverLibraries.find { it.id == id } != null
+@@ -164,6 +169,8 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+       cachedLibraryPodcasts = hashMapOf()
+       isLibraryPodcastsCached = hashMapOf()
+       serverItemsInProgress = listOf()
++      earlyAnswerDone = false // Release Radar fork: the cached "Continue" answer is allowed again after a reset
++      itemsInProgressFromCache = false
+       allLibraryPersonalizationsDone = false
+       libraryPersonalizationsDone = 0
+       return true
+@@ -172,14 +179,15 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+   }
+ 
+   private fun loadItemsInProgressForAllLibraries(cb: (List<ItemInProgress>) -> Unit) {
+-    if (serverItemsInProgress.isNotEmpty()) {
++    if (serverItemsInProgress.isNotEmpty() && !itemsInProgressFromCache) {
+       cb(serverItemsInProgress)
+     } else {
+-      apiHandler.getAllItemsInProgress { itemsInProgress ->
++      apiHandler.getAllItemsInProgress { itemsInProgress, fromCache ->
+         serverItemsInProgress = itemsInProgress.filter {
+           val libraryItem = it.libraryItemWrapper as LibraryItem
+           libraryItem.checkHasTracks()
+         }
++        itemsInProgressFromCache = fromCache
+         cb(serverItemsInProgress)
+       }
+     }
+@@ -873,10 +881,33 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+       callbacks.forEach { it() }
+     }
+ 
++    // Release Radar fork: answer at once with the "Continue" list the server sent last time, so the car
++    // shows it before the server is reached; the full load goes on behind it and rebuilds the root when done
++    if (!earlyAnswerDone && serverItemsInProgress.isEmpty() && serverLibraries.isEmpty()) {
++      // a cold start whose last book was a download, an HLS stream or none: nothing adopted the saved config yet
++      DeviceManager.adoptSavedConfig(DeviceManager.deviceData.lastServerConnectionConfigId)
++      val cached = apiHandler.getCachedItemsInProgress().filter { (it.libraryItemWrapper as? LibraryItem)?.checkHasTracks() == true }
++      if (cached.isNotEmpty()) {
++        earlyAnswerDone = true
++        serverItemsInProgress = cached
++        itemsInProgressFromCache = true
++        cached.forEach { if (it.episode != null) podcastEpisodeLibraryItemMap[it.episode.id] = LibraryItemWithEpisode(it.libraryItemWrapper, it.episode) }
++        val early: List<() -> Unit>
++        synchronized(androidAutoLoadLock) {
++          early = pendingAndroidAutoLoadCallbacks.toList()
++          pendingAndroidAutoLoadCallbacks.clear()
++          pendingAndroidAutoLoadCallbacks.add { onFullLoadDone?.invoke() }
++        }
++        Log.d(tag, "loadAndroidAutoItems: answering early with ${cached.size} cached in-progress items")
++        early.forEach { it() }
++      }
++    }
++
+     // Check if any valid server connection if not use locally downloaded books
+     checkSetValidServerConnectionConfig { isConnected ->
+       if (isConnected) {
+         serverConfigIdUsed = DeviceManager.serverConnectionConfigId
++        earlyAnswerDone = false
+         Log.d(tag, "loadAndroidAutoItems: Connected to server config id=$serverConfigIdUsed")
+ 
+         loadLibraries { libraries ->
+@@ -975,6 +1006,7 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+       DeviceManager.dbManager.getLocalLibraryItem(id)
+     } else {
+       serverLibraryItems.find { it.id == id }
++        ?: serverItemsInProgress.find { it.libraryItemWrapper.id == id }?.libraryItemWrapper // Release Radar fork: cached "Continue" items
+     }
+   }
+ 
+@@ -990,6 +1022,8 @@ class MediaManager(private var apiHandler: ApiHandler, var ctx: Context) {
+       cb(libraryItemWrapper.getPlaybackSession(episode, playItemRequestPayload.deviceInfo))
+     } else {
+       val libraryItem = libraryItemWrapper as LibraryItem
++      // Release Radar fork: the last book starts from the phone; the server is asked for its position afterwards
++      resumeLastSession?.invoke(libraryItem.id, episode?.id)?.let { cb(it); return }
+       apiHandler.playLibraryItem(libraryItem.id,episode?.id ?: "", playItemRequestPayload) {
+         if (it == null) {
+           cb(null)
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt b/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt
+index 8dfcf66..3b39efc 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/media/MediaProgressSyncer.kt
+@@ -91,7 +91,7 @@ class MediaProgressSyncer(
+                                           METERED_CONNECTION_SYNC_INTERVAL
+ 
+                   val currentTime = playerNotificationService.getCurrentTimeSeconds()
+-                  currentPlaybackSession?.let { com.audiobookshelf.app.player.StreamCache.recordPosition(it.libraryItemId, (currentTime * 1000).toLong()) } // Release Radar fork
++                  currentPlaybackSession?.let { com.audiobookshelf.app.player.StreamCache.recordPosition(it, (currentTime * 1000).toLong()) } // Release Radar fork
+                   if (currentTime > 0) {
+                     sync(shouldSyncServer, currentTime) { syncResult ->
+                       Log.d(tag, "Sync complete")
+@@ -145,6 +145,14 @@ class MediaProgressSyncer(
+     }
+   }
+ 
++  // Release Radar fork: one push after a hold is released while paused. pause() already sent a held (empty)
++  // sync and zeroed lastSyncTime, so sync() alone would return at once; give this one catch-up a baseline.
++  fun syncAfterHold(currentTime: Double) {
++    if (currentPlaybackSession == null || listeningTimerRunning || currentTime <= 0) return
++    if (lastSyncTime <= 0) lastSyncTime = System.currentTimeMillis() - 1000L
++    sync(true, currentTime) {}
++  }
++
+   fun pause(cb: () -> Unit) {
+     if (!listeningTimerRunning) return
+ 
+@@ -252,7 +260,11 @@ class MediaProgressSyncer(
+ 
+     // Save playback session to db (server linked sessions only)
+     //   Sessions are removed once successfully synced with the server
+-    currentPlaybackSession?.let { DeviceManager.dbManager.savePlaybackSession(it) }
++    // Release Radar fork: while the server's position is still unknown (held), this phone's position is unconfirmed;
++    // saving it (updatedAt = now) would let the web layer's syncLocalSessions overwrite another device's newer position
++    if (currentIsLocal || !playerNotificationService.holdServerSync) {
++      currentPlaybackSession?.let { DeviceManager.dbManager.savePlaybackSession(it) }
++    }
+ 
+     if (currentIsLocal) {
+       // Save local progress sync
+@@ -297,23 +309,44 @@ class MediaProgressSyncer(
+           cb(SyncResult(false, null, null))
+         }
+       }
++    } else if (hasNetworkConnection && shouldSyncServer && playerNotificationService.holdServerSync) {
++      // Release Radar fork: started from the phone and the server has not said where the book is yet
++      AbsLogger.info("MediaProgressSyncer", "sync: held, the server's position for this resumed session is not known yet (title: \"$currentDisplayTitle\") (currentTime: $currentTime)")
++      cb(SyncResult(false, null, null))
+     } else if (hasNetworkConnection && shouldSyncServer) {
+       AbsLogger.info("MediaProgressSyncer", "sync: Sending progress sync to server (title: \"$currentDisplayTitle\") (currentTime: $currentTime) (session id: ${currentSessionId}) (${DeviceManager.serverConnectionConfigName})")
+ 
+-      apiHandler.sendProgressSync(currentSessionId, syncData) { syncSuccess, errorMsg ->
++      val sentSessionId = currentSessionId
++      val sentSession = currentPlaybackSession // Release Radar fork: closePlayback() or a book switch may replace or clear it before the reply
++      apiHandler.sendProgressSync(sentSessionId, syncData) { syncSuccess, errorMsg ->
+         if (syncSuccess) {
+           AbsLogger.info("MediaProgressSyncer", "sync: Successfully synced progress (title: \"$currentDisplayTitle\") (currentTime: $currentTime) (session id: ${currentSessionId}) (${DeviceManager.serverConnectionConfigName})")
+ 
+           failedSyncs = 0
+           playerNotificationService.alertSyncSuccess()
+           lastSyncTime = System.currentTimeMillis()
+-          DeviceManager.dbManager.removePlaybackSession(currentSessionId) // Remove session from db
++          sentSession?.let { com.audiobookshelf.app.player.StreamCache.recordSynced(it, (currentTime * 1000).toLong()) } // Release Radar fork: the book this sync was for
++          DeviceManager.dbManager.removePlaybackSession(sentSessionId) // Remove session from db
+         } else {
+           failedSyncs++
+           if (failedSyncs == 2) {
+             playerNotificationService.alertSyncFailing() // Show alert in client
+             failedSyncs = 0
+           }
++          // Release Radar fork: the server no longer knows this session (restart, 36 h cleanup, closed earlier)
++          if (sentSession?.isLocal == false && (errorMsg ?: "").contains("code=404")) {
++            if (listeningTimerRunning) {
++              playerNotificationService.renewSession(sentSessionId) // playing: get a new one, keep playing
++            } else if (!playerNotificationService.holdServerSync) {
++              // paused (pause, syncAfterHold) or stopping: no timer will send this again. Hand the server the copy the
++              // way syncLocalSessions does; local-all takes an unknown session id and moves the progress only when the
++              // server's own record is not newer, so another device's newer position still wins
++              val copy = sentSession.clone()
++              apiHandler.sendSyncLocalSessions(listOf(copy)) { ok, _ ->
++                if (ok) DeviceManager.dbManager.removePlaybackSession(copy.id)
++              }
++            }
++          }
+           AbsLogger.error("MediaProgressSyncer", "sync: Progress sync failed (count: $failedSyncs) (title: \"$currentDisplayTitle\") (currentTime: $currentTime) (session id: $currentSessionId) (${DeviceManager.serverConnectionConfigName})")
+         }
+         cb(SyncResult(true, syncSuccess, errorMsg))
+@@ -352,6 +385,15 @@ class MediaProgressSyncer(
+     }
+   }
+ 
++  // Release Radar fork: forget the session at once (no network, no callback), for a caller that switches
++  // books under a running syncer; its timer would otherwise record the new book's time as the old book's
++  fun detach() {
++    listeningTimerTask?.cancel()
++    listeningTimerTask = null
++    listeningTimerRunning = false
++    reset()
++  }
++
+   fun reset() {
+     currentPlaybackSession = null
+     currentLocalMediaProgress = null
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/MediaSessionCallback.kt b/android/app/src/main/java/com/audiobookshelf/app/player/MediaSessionCallback.kt
+index c87e912..2ca2678 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/MediaSessionCallback.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/MediaSessionCallback.kt
+@@ -19,6 +19,12 @@ class MediaSessionCallback(var playerNotificationService:PlayerNotificationServi
+ 
+   override fun onPrepare() {
+     Log.d(tag, "ON PREPARE MEDIA SESSION COMPAT")
++    // Release Radar fork: continue the last book from the phone when it is cached
++    playerNotificationService.resumableLastSession(null, null)?.let { session ->
++      val playbackRate = playerNotificationService.mediaManager.getSavedPlaybackRate()
++      Handler(Looper.getMainLooper()).post { playerNotificationService.preparePlayer(session, true, playbackRate) }
++      return
++    }
+     playerNotificationService.mediaManager.getFirstItem()?.let { li ->
+       playerNotificationService.mediaManager.play(li, null, playerNotificationService.getPlayItemRequestPayload(false)) {
+         if (it == null) {
+@@ -181,7 +187,7 @@ class MediaSessionCallback(var playerNotificationService:PlayerNotificationServi
+ //              }
+ //            }
+ 
+-            if (playerNotificationService.mPlayer.isPlaying) {
++            if (playerNotificationService.isPlayingOrStarting()) {
+               if (0 == mediaButtonClickCount) playerNotificationService.pause()
+               handleMediaButtonClickCount()
+             } else {
+@@ -208,7 +214,7 @@ class MediaSessionCallback(var playerNotificationService:PlayerNotificationServi
+           KeyEvent.KEYCODE_HEADSETHOOK -> {
+             Log.d(tag, "handleCallMediaButton: Headset Hook")
+             if (0 == mediaButtonClickCount) {
+-              if (playerNotificationService.mPlayer.isPlaying)
++              if (playerNotificationService.isPlayingOrStarting())
+                 playerNotificationService.pause()
+               else
+                 playerNotificationService.play()
+@@ -281,6 +287,7 @@ class MediaSessionCallback(var playerNotificationService:PlayerNotificationServi
+       CUSTOM_ACTION_SKIP_FORWARD -> onSkipToNext()
+       CUSTOM_ACTION_SKIP_BACKWARD -> onSkipToPrevious()
+       CUSTOM_ACTION_CHANGE_SPEED -> onChangeSpeed()
++      CUSTOM_ACTION_OTHER_POSITION -> playerNotificationService.jumpToOtherPosition() // Release Radar fork
+     }
+   }
+ }
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt
+index 9ae04a8..3fb36f0 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlaybackDiagnostics.kt
+@@ -78,12 +78,32 @@ class PlaybackDiagnostics(ctx: Context, private val player: ExoPlayer) : Analyti
+   private fun error(msg: String) { io.execute { AbsLogger.error(tag, msg) } }
+ 
+   private fun interesting(d: AudioDeviceInfo) =
+-    d.type != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE && d.type != AudioDeviceInfo.TYPE_TELEPHONY &&
+-      d.type != AudioDeviceInfo.TYPE_BUILTIN_MIC && d.type != AudioDeviceInfo.TYPE_FM_TUNER
++    d.type != AudioDeviceInfo.TYPE_TELEPHONY && d.type != AudioDeviceInfo.TYPE_BUILTIN_MIC && d.type != AudioDeviceInfo.TYPE_FM_TUNER
++
++  private val mediaAttrs = android.media.AudioAttributes.Builder()
++    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
++    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
++    .build()
++
++  /** Where media sound is routed right now (Android 13+ says exactly; older versions list what is connected). */
++  private fun route(): String = try {
++    if (android.os.Build.VERSION.SDK_INT >= 33) {
++      audioManager.getAudioDevicesForAttributes(mediaAttrs).joinToString { describe(it) }.ifEmpty { "none" }
++    } else "?"
++  } catch (_: Exception) { "?" }
++
++  private fun modeName(): String = when (audioManager.mode) {
++    AudioManager.MODE_NORMAL -> "normal"
++    AudioManager.MODE_RINGTONE -> "ringtone"
++    AudioManager.MODE_IN_CALL -> "in call"
++    AudioManager.MODE_IN_COMMUNICATION -> "in communication"
++    else -> "${audioManager.mode}"
++  }
+ 
+   private fun describe(d: AudioDeviceInfo): String {
+     val type = when (d.type) {
+       AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
++      AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+       AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired headset"
+       AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired headphones"
+       AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "bluetooth"
+@@ -122,10 +142,10 @@ class PlaybackDiagnostics(ctx: Context, private val player: ExoPlayer) : Analyti
+       Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS -> "AUDIO FOCUS LOSS"
+       else -> "${player.playbackSuppressionReason}"
+     }
+-    String.format(Locale.US, "pos %ds buffered +%ds state=%s playWhenReady=%s suppression=%s vol=%.2f devVol=%d/%d speed=%.2f loading=%s musicActive=%s outputs=%s",
++    String.format(Locale.US, "pos %ds buffered +%ds state=%s playWhenReady=%s suppression=%s vol=%.2f devVol=%d/%d speed=%.2f loading=%s musicActive=%s mode=%s route=%s outputs=%s",
+       pos / 1000, ahead, stateName(player.playbackState), player.playWhenReady, suppression, player.volume,
+       audioManager.getStreamVolume(AudioManager.STREAM_MUSIC), audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+-      player.playbackParameters.speed, player.isLoading, audioManager.isMusicActive, outputs())
++      player.playbackParameters.speed, player.isLoading, audioManager.isMusicActive, modeName(), route(), outputs())
+   } catch (e: Exception) { "snapshot failed: ${e.message}" }
+ 
+   override fun onPlayWhenReadyChanged(eventTime: EventTime, playWhenReady: Boolean, reason: Int) {
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerConstants.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerConstants.kt
+index 35d787a..7d13b74 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerConstants.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerConstants.kt
+@@ -5,6 +5,7 @@ const val CUSTOM_ACTION_JUMP_BACKWARD = "com.audiobookshelf.customAction.jump_ba
+ const val CUSTOM_ACTION_SKIP_FORWARD = "com.audiobookshelf.customAction.skip_forward";
+ const val CUSTOM_ACTION_SKIP_BACKWARD = "com.audiobookshelf.customAction.skip_backward";
+ const val CUSTOM_ACTION_CHANGE_SPEED = "com.audiobookshelf.customAction.change_speed";
++const val CUSTOM_ACTION_OTHER_POSITION = "com.audiobookshelf.customAction.other_position"; // Release Radar fork: the way back, in the car
+ 
+ const val PLAYMETHOD_DIRECTPLAY = 0
+ const val PLAYMETHOD_DIRECTSTREAM = 1
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt
+index 0a4ef97..46d1aa6 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerListener.kt
+@@ -14,6 +14,7 @@ class PlayerListener(var playerNotificationService:PlayerNotificationService) :
+ 
+   companion object {
+     var lastPauseTime: Long = 0   //ms
++    var internalSeekPending = false // Release Radar fork: the next SEEK is the app's own (auto-rewind, reconcile), not the listener's
+     var lazyIsPlaying: Boolean = false
+   }
+ 
+@@ -33,11 +34,18 @@ class PlayerListener(var playerNotificationService:PlayerNotificationService) :
+       Log.d(tag, "onPositionDiscontinuity: oldPosition=${oldPosition.positionMs}/${oldPosition.mediaItemIndex}, newPosition=${newPosition.positionMs}/${newPosition.mediaItemIndex}, isPlaying=${playerNotificationService.currentPlayer.isPlaying} reason=SEEK")
+       playerNotificationService.mediaProgressSyncer.seek()
+       lastPauseTime = 0 // When seeking while paused reset the auto-rewind
++      if (internalSeekPending) internalSeekPending = false else playerNotificationService.noteListenerSeek() // Release Radar fork
+     } else {
+       Log.d(tag, "onPositionDiscontinuity: oldPosition=${oldPosition.positionMs}/${oldPosition.mediaItemIndex}, newPosition=${newPosition.positionMs}/${newPosition.mediaItemIndex}, isPlaying=${playerNotificationService.currentPlayer.isPlaying}, reason=$reason")
+     }
+   }
+ 
++  // Release Radar fork: a pause made while BUFFERING (a stall, right after a seek) never reaches
++  // onIsPlayingChanged (isPlaying was already false); stamp the pause from playWhenReady as well
++  override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
++    if (!playWhenReady) playerNotificationService.pausedSinceAt = System.currentTimeMillis()
++  }
++
+   override fun onIsPlayingChanged(isPlaying: Boolean) {
+     Log.d(tag, "onIsPlayingChanged to $isPlaying | ${playerNotificationService.getMediaPlayer()} | playbackState=${playerNotificationService.currentPlayer.playbackState}")
+ 
+@@ -55,6 +63,7 @@ class PlayerListener(var playerNotificationService:PlayerNotificationService) :
+     }
+ 
+     lazyIsPlaying = isPlaying
++    playerNotificationService.pausedSinceAt = if (isPlaying) 0L else System.currentTimeMillis() // Release Radar fork
+ 
+     // Update widget
+     DeviceManager.widgetUpdater?.onPlayerChanged(playerNotificationService)
+@@ -86,6 +95,7 @@ class PlayerListener(var playerNotificationService:PlayerNotificationService) :
+ //        }
+ 
+         if (seekBackTime > 0L) {
++          internalSeekPending = true // the auto-rewind is not the listener moving
+           playerNotificationService.seekBackward(seekBackTime)
+         }
+       }
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+index 1f3da70..ab37941 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/PlayerNotificationService.kt
+@@ -94,7 +94,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     fun onNetworkMeteredChanged(isUnmetered: Boolean)
+     fun onMediaItemHistoryUpdated(mediaItemHistory: MediaItemHistory)
+     fun onPlaybackSpeedChanged(playbackSpeed: Float)
+-    fun onPositions(syncedMs: Long, localMs: Long) // Release Radar fork: the session now sits at the synced position; this phone was at localMs
++    fun onPositions(syncedMs: Long, localMs: Long, atLocal: Boolean) // Release Radar fork: both positions of the book; atLocal = the player stayed at this phone's
+   }
+   private val binder = LocalBinder()
+ 
+@@ -124,6 +124,30 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+   var currentPlaybackSession: PlaybackSession? = null
+   private var initialPlaybackRate: Float? = null
+   private var diagnostics: PlaybackDiagnostics? = null // Release Radar fork
++  @Volatile var pausedSinceAt = 0L // Release Radar fork: when playback last stopped (a seek while paused does not reset it)
++  @Volatile private var parkedAt = 0L // the reconcile moved the paused player; this phone has not played there
++  @Volatile private var startCancelled = false
++  private var pendingStart: Runnable? = null
++  private var firstAttemptCb: (() -> Unit)? = null
++  @Volatile private var renewedSessionId: String? = null
++  private lateinit var notificationPlayer: Player
++  private var resumedSessionId: String? = null // Release Radar fork: a session restarted from the phone, not from the server
++  @Volatile private var reusedSessionId: String? = null // a session id taken from the cache, possibly closed on the server
++  private var switchGeneration = 0 // a later switch request supersedes a pending renewed cast switch
++  private var destroyed = false // main thread: a reconcile answer that lands after onDestroy is dropped
++  @Volatile var sessionResumedFromCache = false
++  @Volatile private var renewing = false
++  // Release Radar fork: a session started from the phone holds its progress syncs until the server has
++  // said where the book is (another device may have moved it); the check is retried while it fails
++  @Volatile var holdServerSync = false
++  private var reconcileBaselineAt = 0L
++  private var reconcileAttempts = 0
++  private var reconcileGen = 0 // main thread only: an answer from an older hold chain is ignored
++  private var playingSinceAt = 0L
++  private var playingSinceMs = 0L
++  @Volatile private var listenerSeekAt = 0L // the last seek the listener made (the app's own seeks are not counted)
++  fun noteListenerSeek() { listenerSeekAt = System.currentTimeMillis() }
++  private val reconcileRetry = Runnable { retryReconcile() }
+ 
+   private val metadataScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+   private var metadataArtJob: Job? = null
+@@ -206,8 +230,13 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     DeviceManager.widgetUpdater?.onPlayerChanged(this)
+ 
+     diagnostics?.detach() // Release Radar fork
++    destroyed = true
++    cancelHeldStart()
+     StreamCache.cancel()
+-    currentPlaybackSession?.let { s -> if (currentPlayer.playbackState != Player.STATE_IDLE) StreamCache.recordPosition(s.libraryItemId, getCurrentTime()) }
++    currentPlaybackSession?.let { s ->
++      // not when the reconcile only parked the paused player at the server position
++      if (currentPlayer.playbackState != Player.STATE_IDLE && parkedAt <= playingSinceAt) StreamCache.recordPosition(s, getCurrentTime())
++    }
+     playerNotificationManager.setPlayer(null)
+     mPlayer.release()
+     castPlayer?.release()
+@@ -250,6 +279,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     com.audiobookshelf.app.server.ServerRoute.start(ctx) // Release Radar fork
+ 
+     DbManager.initialize(ctx)
++    AbsLogger.installCrashHandler() // Release Radar fork: Android Auto starts this process without the activity
+     StreamCache.init(ctx) // Release Radar fork: on-disk cache for streamed audio
+ 
+     // Initialize API
+@@ -267,8 +297,18 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+ 
+     // Initialize media manager
+     mediaManager = MediaManager(apiHandler, ctx)
++    // Release Radar fork: Android Auto starts the last book from the phone, and rebuilds its root once the server answered
++    mediaManager.resumeLastSession = { id, ep -> resumableLastSession(id, ep) }
++    mediaManager.onFullLoadDone = {
++      forceReloadingAndroidAuto = true
++      notifyChildrenChanged("/")
++    }
+ 
+-    StreamCache.prebufferLastSession("startup") // Release Radar fork: the last book's window, before anyone presses play
++    // Release Radar fork: the last book's windows (this phone's and the server's), before anyone presses play
++    StreamCache.progressFetcher = { itemId, episodeId, cb ->
++      apiHandler.getMediaProgress(itemId, episodeId, null) { p -> cb(p?.let { (it.currentTime * 1000).toLong() }) }
++    }
++    StreamCache.prebufferLastSession("startup")
+ 
+     channelId =
+             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+@@ -427,8 +467,16 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+                     .build()
+     mPlayer.setAudioAttributes(audioAttributes, true)
+ 
++    // Release Radar fork: the notification's own buttons (Android 12 and older) call Player.play() directly;
++    // send that through play() so the long-pause server check runs there too
++    notificationPlayer = object : ForwardingPlayer(mPlayer) {
++      override fun play() { this@PlayerNotificationService.play() }
++      override fun setPlayWhenReady(playWhenReady: Boolean) {
++        if (playWhenReady) this@PlayerNotificationService.play() else super.setPlayWhenReady(false)
++      }
++    }
+     // attach player to playerNotificationManager
+-    playerNotificationManager.setPlayer(mPlayer)
++    playerNotificationManager.setPlayer(notificationPlayer)
+ 
+     mediaSessionConnector.setPlayer(mPlayer)
+   }
+@@ -439,8 +487,11 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+   fun preparePlayer(
+           playbackSession: PlaybackSession,
+           playWhenReady: Boolean,
+-          playbackRate: Float?
++          playbackRate: Float?,
++          serverStartMs: Long? = null // Release Radar fork: where the server holds the book when the caller overrode the start
+   ) {
++    // Release Radar fork: what the server holds, read before the finished-book reset below
++    val serverHeldMs = serverStartMs ?: playbackSession.currentTimeMs
+     if (!isStarted) {
+       Log.i(tag, "preparePlayer: foreground service not started - Starting service --")
+       Intent(ctx, PlayerNotificationService::class.java).also { intent ->
+@@ -454,6 +505,8 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+             tag,
+             "Prepare Player Session Current Time=${playbackSession.currentTime}, Duration=${playbackSession.duration}"
+     )
++    // Release Radar fork: decided before the reset below, so a book that really starts at 0 is not taken for a finished one
++    val finishedRestart = playbackSession.duration > 0 && playbackSession.duration - playbackSession.currentTime < 5
+     if (playbackSession.duration - playbackSession.currentTime < 5) {
+       Log.d(tag, "Prepare Player Session is finished, so restart it")
+       playbackSession.currentTime = 0.0
+@@ -461,6 +514,11 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+ 
+     isClosed = false
+ 
++    // Release Radar fork: every streamed book plays from the library files, never from its session URL, so a
++    // session the server drops (restart, cleanup, closed last night) cannot break the stream; same cache keys
++    playbackSession.useFileUrls = getMediaPlayer() != PLAYER_CAST && !playbackSession.isLocal && playbackSession.isDirectPlay &&
++      playbackSession.audioTracks.isNotEmpty() && playbackSession.audioTracks.all { playbackSession.fileUri(it) != null }
++
+     val mediaItems = playbackSession.getMediaItems(ctx)
+     val playbackRateToUse = playbackRate ?: initialPlaybackRate ?: 1f
+     initialPlaybackRate = playbackRate
+@@ -483,25 +541,57 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+       playerNotificationManager.setPlayer(castPlayer)
+     }
+ 
++    // Release Radar fork: an Android Auto pick (onPlayFromMediaId / onPlayFromSearch / onPrepare) switches books
++    // without stopping the syncer; its timer would record and save the new book's time as the old book's position
++    if (mediaProgressSyncer.currentPlaybackSession != null && mediaProgressSyncer.currentSessionId != playbackSession.id) {
++      mediaProgressSyncer.detach()
++      PlayerListener.lazyIsPlaying = false // the new book's first isPlaying=true then starts the syncer on it
++    }
+     // Release Radar fork: remember where this phone left the previous book
+     currentPlaybackSession?.let { prev ->
+-      if (prev.libraryItemId != playbackSession.libraryItemId && currentPlayer.playbackState != Player.STATE_IDLE) {
+-        StreamCache.recordPosition(prev.libraryItemId, getCurrentTime())
++      // not when the reconcile only parked the paused player at the server position (same rule as onDestroy)
++      if ((prev.libraryItemId != playbackSession.libraryItemId || prev.episodeId != playbackSession.episodeId) &&
++        currentPlayer.playbackState != Player.STATE_IDLE && parkedAt <= playingSinceAt) {
++        StreamCache.recordPosition(prev, getCurrentTime())
+       }
+     }
+ 
++    val sameSession = currentPlaybackSession?.id == playbackSession.id // a player switch re-prepares the syncer's copy, not the server's start
+     currentPlaybackSession = playbackSession
++    parkedAt = 0L // Release Radar fork: per session
++    sessionResumedFromCache = playbackSession.id == resumedSessionId // Release Radar fork
++    val freshServerSession = !playbackSession.isLocal && !sessionResumedFromCache && playbackSession.id != renewedSessionId && !sameSession
++    // what this phone last got the server to accept, read BEFORE this session's start overwrites the record
++    val sentBefore = if (freshServerSession) StreamCache.syncedPosition(playbackSession) else null
++    if (freshServerSession) {
++      // a fresh server session starts where the server holds the book: that is what this phone has "synced"
++      StreamCache.recordSynced(playbackSession, serverHeldMs)
++    }
+     DeviceManager.setLastPlaybackSession(
+             playbackSession
+     ) // Save playback session to use when app is closed
+ 
+     // Release Radar fork: this phone's own position vs the synced one the session starts at.
+     // Both windows stay cached; the player offers the way back to this phone's position.
+-    val localPos = StreamCache.localPosition(playbackSession.libraryItemId)
+-    StreamCache.setCandidates(playbackSession, playbackSession.currentTimeMs, localPos)
++    var localPos = if (finishedRestart) null else StreamCache.localPosition(playbackSession)
++    if (freshServerSession && !finishedRestart && serverStartMs == null && localPos != null) {
++      // the server holds exactly what this phone last sent (no other device moved the book) but this phone got
++      // further and those syncs failed: start where this phone is; the server's position stays one tap away
++      val sent = sentBefore
++      val serverStart = playbackSession.currentTimeMs
++      if (sent != null && kotlin.math.abs(serverStart - sent) < 2000 && kotlin.math.abs(localPos - serverStart) > 30_000L) {
++        AbsLogger.info(tag, "prepare: the server holds ${serverStart / 1000} s, which this phone sent; this phone is at ${localPos / 1000} s: starting there")
++        playbackSession.currentTime = localPos / 1000.0
++        StreamCache.setCandidates(playbackSession, serverStart, localPos)
++        localPos = null
++      }
++    }
++    if (localPos != null || StreamCache.syncedStart(playbackSession) == null) StreamCache.setCandidates(playbackSession, playbackSession.currentTimeMs, localPos)
+     if (!playbackSession.isLocal && localPos != null && kotlin.math.abs(localPos - playbackSession.currentTimeMs) > 30_000L) {
+       StreamCache.prebuffer(playbackSession, localPos, "this phone's position", delayMs = 10_000)
+     }
++    // the session starts at the server's (or the chosen) position: that is this phone's position from now on
++    if (freshServerSession && localPos != null) StreamCache.recordPosition(playbackSession, playbackSession.currentTimeMs)
+ 
+     metadataArtJob?.cancel()
+     metadataArtJob =
+@@ -543,7 +633,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+         mediaSources = mediaItems.map { factory.createMediaSource(it) }
+       } else if (!playbackSession.isHLS) {
+         AbsLogger.info("PlayerNotificationService", "preparePlayer: Direct playing item ${currentPlaybackSession?.mediaItemId}.")
+-        val httpFactory = OkHttpDataSource.Factory(AbsHttp.client) // Release Radar fork: shared pool, IPv4 first
++        val httpFactory = OkHttpDataSource.Factory(AbsHttp.playerClient) // Release Radar fork: shared pool, IPv4 first, current token
+         httpFactory.setUserAgent(channelId)
+         StreamCache.register(playbackSession)
+         val dataSourceFactory = StreamCache.wrap(httpFactory) // Release Radar fork: index + audio around the position from disk
+@@ -594,6 +684,18 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+       currentPlayer.setPlaybackSpeed(playbackRateToUse)
+ 
+       currentPlayer.prepare()
++
++      // Release Radar fork: started from the phone; now ask the server whether the book moved meanwhile.
++      // Until it answers, this phone does not push its own (possibly older) position.
++      if (sessionResumedFromCache) {
++        resumedSessionId = null
++        playingSinceAt = System.currentTimeMillis()
++        playingSinceMs = playbackSession.currentTimeMs
++        beginHeldReconcile(reconcileBaselineAt, null)
++      } else if (!sameSession) { // a player switch re-prepares the same session: an unanswered hold and its retry chain stay
++        holdServerSync = false
++        android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(reconcileRetry)
++      }
+     } else if (castPlayer != null) {
+       val currentTrackIndex = playbackSession.getCurrentTrackIndex()
+       val currentTrackTime = playbackSession.getCurrentTrackTimeMs()
+@@ -627,9 +729,44 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+               )
+       )
+     }
++    customActionProviders.add(OtherPositionCustomActionProvider()) // Release Radar fork: shown only while the two positions differ
+     mediaSessionConnector.setCustomActionProviders(*customActionProviders.toTypedArray())
+   }
+ 
++  // Release Radar fork: the position of this book the player is NOT at (this phone's or the synced
++  // one), as a button on the car screen and in any media controller; null when there is nothing to offer
++  private fun otherPosition(): Pair<Long, String>? {
++    val session = currentPlaybackSession ?: return null
++    if (session.isLocal) return null
++    val synced = StreamCache.syncedStart(session) ?: return null
++    val local = StreamCache.localStart(session) ?: return null
++    if (kotlin.math.abs(synced - local) < 30_000L) return null
++    val here = getCurrentTime()
++    val toLocal = kotlin.math.abs(here - local) > kotlin.math.abs(here - synced)
++    val target = if (toLocal) local else synced
++    val s = target / 1000
++    val label = String.format(java.util.Locale.US, "%s %d:%02d:%02d", if (toLocal) "This phone" else "Synced", s / 3600, (s % 3600) / 60, s % 60)
++    return Pair(target, label)
++  }
++
++  fun jumpToOtherPosition() {
++    val (target, label) = otherPosition() ?: return
++    AbsLogger.info(tag, "car: jumping to the other position ($label)")
++    seekPlayer(target)
++    mediaSessionConnector.invalidateMediaSessionPlaybackState()
++  }
++
++  inner class OtherPositionCustomActionProvider : CustomActionProvider {
++    override fun onCustomAction(player: Player, action: String, extras: Bundle?) {
++      // handled in MediaSessionCallback.onCustomAction, like the other actions
++    }
++
++    override fun getCustomAction(player: Player): PlaybackStateCompat.CustomAction? {
++      val (_, label) = otherPosition() ?: return null
++      return PlaybackStateCompat.CustomAction.Builder(CUSTOM_ACTION_OTHER_POSITION, label, R.drawable.md_clock_outline).build()
++    }
++  }
++
+   fun setMediaSessionConnectorPlaybackActions() {
+     var playbackActions =
+             PlaybackStateCompat.ACTION_PLAY_PAUSE or
+@@ -657,8 +794,11 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+         mediaProgressSyncer.stop(false) {
+           apiHandler.playLibraryItem(libraryItemId, episodeId, playItemRequestPayload) {
+             if (it == null) { // Play request failed
+-              clientEventEmitter?.onPlaybackFailed(errorMessage)
+-              closePlayback(true)
++              Handler(Looper.getMainLooper()).post { // Release Radar fork: closePlayback reads the player, main thread only
++                if (currentPlaybackSession?.id != playbackSession.id) return@post
++                clientEventEmitter?.onPlaybackFailed(errorMessage)
++                closePlayback(true)
++              }
+             } else {
+               Handler(Looper.getMainLooper()).post { preparePlayer(it, true, null) }
+             }
+@@ -724,7 +864,34 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     }
+   }
+ 
++  // Release Radar fork: the receiver streams the /public/session URLs, which a session reused from the cache may
++  // no longer have on the server: fetch a fresh session at the same position first, then switch
+   fun switchToPlayer(useCastPlayer: Boolean) {
++    val generation = ++switchGeneration
++    val session = currentPlaybackSession
++    if (useCastPlayer && session != null && session.id == reusedSessionId && !session.isLocal && session.libraryItemId != null) {
++      val positionMs = getCurrentTime()
++      reusedSessionId = null
++      apiHandler.playLibraryItem(session.libraryItemId!!, session.episodeId ?: "", getPlayItemRequestPayload(false)) { fresh ->
++        Handler(Looper.getMainLooper()).post {
++          if (generation != switchGeneration || isClosed) return@post // superseded, or playback closed meanwhile
++          if (fresh != null && currentPlaybackSession?.id == session.id) {
++            fresh.currentTime = positionMs / 1000.0
++            renewedSessionId = fresh.id
++            currentPlaybackSession = fresh
++            DeviceManager.setLastPlaybackSession(fresh)
++            StreamCache.setCandidates(fresh, StreamCache.syncedStart(session) ?: fresh.currentTimeMs, StreamCache.localStart(session))
++            mediaProgressSyncer.reset()
++          }
++          switchToPlayerNow(useCastPlayer)
++        }
++      }
++      return
++    }
++    switchToPlayerNow(useCastPlayer)
++  }
++
++  private fun switchToPlayerNow(useCastPlayer: Boolean) {
+     val wasPlaying = currentPlayer.isPlaying
+     if (useCastPlayer) {
+       if (currentPlayer == castPlayer) {
+@@ -768,7 +935,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+             } else {
+               Log.d(tag, "switchToPlayer: Using ExoPlayer")
+               mediaSessionConnector.setPlayer(mPlayer)
+-              playerNotificationManager.setPlayer(mPlayer)
++              playerNotificationManager.setPlayer(notificationPlayer) // Release Radar fork: through play()
+               setMediaSessionToLocalVolume()
+               mPlayer
+             }
+@@ -983,56 +1150,273 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+       Log.d(tag, "Already playing")
+       return
+     }
++    if (pendingStart != null) {
++      Log.d(tag, "Start already pending")
++      return
++    }
+     currentPlayer.volume = 1F
+     // Release Radar fork: after a longer pause, ask the server where the book is before continuing
+     // (another device may have moved it); never wait more than 2 s for the answer
+-    val pausedForMs = if (PlayerListener.lastPauseTime > 0) System.currentTimeMillis() - PlayerListener.lastPauseTime else 0L
+-    if (pausedForMs > 60_000L && currentPlaybackSession?.isLocal == false && currentPlayer == mPlayer) {
+-      var started = false
+-      val start = Runnable { if (!started) { started = true; currentPlayer.play() } }
++    val pausedForMs = if (pausedSinceAt > 0) System.currentTimeMillis() - pausedSinceAt else 0L
++    startCancelled = false
++    if (pausedForMs > 60_000L && currentPlaybackSession?.isLocal == false && currentPlayer == mPlayer && pendingStart == null) {
++      // after a longer pause: ask the server first (never wait more than 2 s), keep asking until it
++      // answers, and hold this phone's own syncs until then
+       val main = android.os.Handler(android.os.Looper.getMainLooper())
++      val start = object : Runnable {
++        override fun run() {
++          if (pendingStart !== this) return
++          pendingStart = null
++          if (startCancelled) return
++          adoptParkedPosition()
++          playingSinceAt = System.currentTimeMillis()
++          playingSinceMs = getCurrentTime()
++          currentPlayer.play()
++        }
++      }
++      pendingStart = start
+       main.postDelayed(start, 2000)
+-      reconcileServerProgress("play") { main.post(start) }
++      val baseline = currentPlaybackSession?.let { StreamCache.localPositionAt(it) } ?: mediaProgressSyncer.lastSyncedAt
++      beginHeldReconcile(baseline) { main.post(start) }
+       return
+     }
++    adoptParkedPosition()
++    playingSinceAt = System.currentTimeMillis()
++    playingSinceMs = getCurrentTime()
+     currentPlayer.play()
+   }
+ 
++  // Release Radar fork: the reconcile parked the paused player at the server position; once this phone really
++  // continues from there, that position becomes what it has "synced"
++  private fun adoptParkedPosition() {
++    val s = currentPlaybackSession ?: return
++    if (parkedAt > playingSinceAt) StreamCache.syncedStart(s)?.let {
++      StreamCache.recordSynced(s, it)
++      StreamCache.recordPosition(s, getCurrentTime()) // it is this phone's position from now on; the way back stays in the candidates
++    }
++  }
++
++  // Release Radar fork: hold this phone's syncs and keep asking the server (every 10 s, up to 10 min)
++  // where the book is; [onFirstAttempt] runs after the first answer or failure
++  private fun beginHeldReconcile(baselineAt: Long, onFirstAttempt: (() -> Unit)?) {
++    reconcileGen++ // a request still in flight from an earlier hold no longer continues the chain
++    holdServerSync = true
++    reconcileBaselineAt = baselineAt
++    reconcileAttempts = 0
++    firstAttemptCb = onFirstAttempt
++    android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(reconcileRetry)
++    retryReconcile()
++  }
++
++  private fun retryReconcile() {
++    val session = currentPlaybackSession ?: run { holdServerSync = false; firstAttemptCb?.invoke(); firstAttemptCb = null; return }
++    if (!holdServerSync) { firstAttemptCb?.invoke(); firstAttemptCb = null; return }
++    reconcileAttempts++
++    val gen = reconcileGen
++    reconcileServerProgress("resume", reconcileBaselineAt) { answered, moved ->
++      if (gen != reconcileGen) return@reconcileServerProgress // a newer hold (or a cancel) owns the chain now
++      firstAttemptCb?.invoke()
++      firstAttemptCb = null
++      if (answered || currentPlaybackSession?.id != session.id) {
++        holdServerSync = false
++        // released while paused: what was listened during the hold was neither pushed nor saved, and a paused
++        // player has no timer to send it; the server holds nothing newer, so send it once now
++        if (answered && !moved && !currentPlayer.isPlaying && currentPlaybackSession?.id == session.id) {
++          mediaProgressSyncer.syncAfterHold(getCurrentTimeSeconds())
++        }
++      } else {
++        // keep holding until the server answers: no sync can land while it is unreachable, and the moment it
++        // is reachable again is exactly when another device's newer position has to win; slow down after 10 min
++        if (reconcileAttempts == 60) AbsLogger.info(tag, "reconcile: no answer in 10 min, still holding this phone's syncs; asking every minute now")
++        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(reconcileRetry, if (reconcileAttempts < 60) 10_000 else 60_000)
++      }
++    }
++  }
++
++  // Release Radar fork: the last streamed book can start again from the phone: same server session (the
++  // server keeps it open for 36 h), the index and the audio around this phone's position already on disk.
++  // The server is then asked for its position in the background; if it dropped the session, a new one is
++  // fetched on the first failed sync and playback carries on (see renewSession).
++  fun resumableLastSession(libraryItemId: String?, episodeId: String?): PlaybackSession? {
++    if (getMediaPlayer() == PLAYER_CAST) return null // the receiver streams from the server: take the /play path
++    val s = DeviceManager.deviceData.lastPlaybackSession ?: return null
++    if (s.isLocal || !s.isDirectPlay) return null
++    if (libraryItemId != null && s.libraryItemId != libraryItemId) return null
++    if (libraryItemId != null && (episodeId ?: "") != (s.episodeId ?: "")) return null
++    if (!DeviceManager.adoptSavedConfig(s.serverConnectionConfigId)) return null
++    // the loaded session a reconcile parked at the server's newer position (the listener has not moved it since):
++    // a tap on it in the car or an onPrepare continues from there, not from the stale local record
++    val parkedHere = currentPlaybackSession?.id == s.id && parkedAt > playingSinceAt && listenerSeekAt <= parkedAt &&
++      currentPlayer.playbackState != Player.STATE_IDLE
++    val pos = if (parkedHere) getCurrentTime() else (StreamCache.localPosition(s) ?: s.currentTimeMs)
++    // a book this phone last knew as finished (its own or the server's record near the end) is not resumed from
++    // the phone: the /play path restarts it the way the server does, and nothing older is pushed over a finish
++    val durMs = (s.duration * 1000).toLong()
++    val lastSynced = StreamCache.syncedPosition(s)
++    if (durMs > 0 && ((lastSynced != null && lastSynced > durMs - 10_000) || pos > durMs - 10_000 || pos <= 0)) return null
++    if (!StreamCache.isWarm(s, pos)) return null
++    s.currentTime = pos / 1000.0
++    resumedSessionId = s.id
++    reusedSessionId = s.id
++    reconcileBaselineAt = StreamCache.localPositionAt(s) ?: 0L
++    AbsLogger.info(tag, "resume: ${s.displayTitle} starts at ${pos / 1000} s from the phone (session ${s.id} reused)")
++    return s
++  }
++
++  fun renewSession(failedSessionId: String) {
++    android.os.Handler(android.os.Looper.getMainLooper()).post {
++      val old = currentPlaybackSession ?: return@post
++      if (mediaProgressSyncer.currentSessionId != failedSessionId) return@post // the syncer already moved on
++      if (old.id != failedSessionId) {
++        // the syncer still holds a session the player has left (an Android Auto pick does not reset it); the server
++        // closed that one when the player's was opened: sync the player's session instead of opening another
++        mediaProgressSyncer.stop(false) {
++          android.os.Handler(android.os.Looper.getMainLooper()).post {
++            if (currentPlayer.playWhenReady || PlayerListener.lazyIsPlaying) mediaProgressSyncer.play(old)
++          }
++        }
++        return@post
++      }
++      val itemId = old.libraryItemId ?: return@post
++      if (renewing) return@post
++      renewing = true
++      val positionMs = getCurrentTime()
++      val wasPlaying = currentPlayer.isPlaying
++      AbsLogger.info(tag, "renew: the server no longer has session ${old.id}; asking for a new one at ${positionMs / 1000} s")
++      apiHandler.playLibraryItem(itemId, old.episodeId ?: "", getPlayItemRequestPayload(false)) { fresh ->
++        android.os.Handler(android.os.Looper.getMainLooper()).post {
++          renewing = false
++          if (fresh == null || currentPlaybackSession?.id != old.id || mediaProgressSyncer.currentPlaybackSession?.id != old.id) return@post
++          val serverMs = fresh.currentTimeMs // where the server holds the book: the 404 means it never got this phone's position
++          // the player keeps playing the same bytes; only the session (for syncs) is swapped
++          fresh.currentTime = getCurrentTime() / 1000.0
++          fresh.mediaPlayer = old.mediaPlayer
++          fresh.useFileUrls = old.useFileUrls
++          sessionResumedFromCache = false
++          renewedSessionId = fresh.id
++          currentPlaybackSession = fresh
++          DeviceManager.setLastPlaybackSession(fresh)
++          StreamCache.register(fresh)
++          StreamCache.setCandidates(fresh, StreamCache.syncedStart(old) ?: fresh.currentTimeMs, StreamCache.localStart(old))
++          StreamCache.recordSynced(fresh, serverMs)
++          mediaProgressSyncer.stop(false) {
++            android.os.Handler(android.os.Looper.getMainLooper()).post {
++              // by the listener's state, not the instantaneous one: during a stall PlayerListener keeps lazyIsPlaying
++              // and will ignore the coming play event, so nothing else would restart the syncer
++              if (currentPlayer.playWhenReady || PlayerListener.lazyIsPlaying) mediaProgressSyncer.play(fresh)
++              clientEventEmitter?.onPlaybackSession(fresh)
++              // the player did not change state, so no metadata event would follow: send one so the app leaves its loading state
++              sendClientMetadata(when (currentPlayer.playbackState) {
++                Player.STATE_BUFFERING -> PlayerState.BUFFERING
++                Player.STATE_ENDED -> PlayerState.ENDED
++                Player.STATE_IDLE -> PlayerState.IDLE
++                else -> PlayerState.READY
++              })
++              AbsLogger.info(tag, "renew: now syncing to session ${fresh.id}; playback untouched")
++            }
++          }
++        }
++      }
++    }
++  }
++
+   // Release Radar fork: another device may have moved the server's position since this phone last
+   // synced. Continue from there and keep this phone's position one tap away (the Audible way).
+-  fun reconcileServerProgress(reason: String, cb: ((moved: Boolean) -> Unit)? = null) {
++  // [baselineAt]: when this phone last recorded its own position for the book; the server only wins
++  // when its record is newer than that (another device listened later), never when this phone's
++  // last sync simply failed and the server still holds an older position.
++  // cb(answered, moved): answered = the server replied; moved = the player was moved to its position.
++  fun reconcileServerProgress(reason: String, baselineAt: Long = currentPlaybackSession?.let { StreamCache.localPositionAt(it) } ?: mediaProgressSyncer.lastSyncedAt, cb: ((answered: Boolean, moved: Boolean) -> Unit)? = null) {
+     val session = currentPlaybackSession
+     val itemId = session?.libraryItemId
+     if (session == null || itemId == null || session.isLocal || currentPlayer.playbackState == Player.STATE_IDLE) {
+-      cb?.invoke(false)
++      cb?.invoke(false, false)
+       return
+     }
+-    val sinceMs = mediaProgressSyncer.lastSyncedAt
+-    apiHandler.getMediaProgress(itemId, session.episodeId, null) { progress ->
++    apiHandler.getMediaProgressOrNone(itemId, session.episodeId) { progress, noRecord ->
+       android.os.Handler(android.os.Looper.getMainLooper()).post {
++        if (destroyed) return@post
+         if (progress == null || currentPlaybackSession?.id != session.id) {
+-          cb?.invoke(false)
++          // "no record" is an answer: the server holds nothing for this book, this phone's position may be sent
++          cb?.invoke(noRecord && currentPlaybackSession?.id == session.id, false)
++          return@post
++        }
++        val durMs = (session.duration * 1000).toLong()
++        val serverRawMs = (progress.currentTime * 1000).toLong()
++        val finished = progress.isFinished || (durMs > 0 && serverRawMs > durMs - 5000)
++        val sentMs = StreamCache.syncedPosition(session)
++        // this phone's own finish (it sent it, or the server holds exactly what it last sent, or the record predates
++        // this session: a finished book this phone restarted through /play) is not another device's: not moved
++        val ownFinish = finished && sentMs != null && ((durMs > 0 && sentMs > durMs - 10_000) || kotlin.math.abs(serverRawMs - sentMs) <= 2000)
++        val finishPredatesSession = finished && session.startedAt > 0 && progress.lastUpdate <= session.startedAt && session.id != renewedSessionId
++        if (ownFinish || finishPredatesSession) {
++          cb?.invoke(true, false)
+           return@post
+         }
+-        val serverMs = (progress.currentTime * 1000).toLong()
++        // finished on another device: the book starts over, as /play would start it; this phone's position stays
++        // the way back. Nothing of this phone's may be pushed over that finished record.
++        val serverMs = if (finished) 0L else serverRawMs
+         val hereMs = getCurrentTime()
+-        val newer = progress.lastUpdate > sinceMs + 2000
++        // "someone else moved it": the server holds a position this phone never sent (clock-free);
++        // only when nothing was ever sent from this phone does the record time decide. A position this session
++        // already parked the paused player at is known here, though this phone never sent it.
++        val parkedMs = if (parkedAt > 0) StreamCache.syncedStart(session) else null
++        val known = parkedMs != null && kotlin.math.abs(serverMs - parkedMs) <= 2000
++        // a finish this session already parked the paused player at (and it has not played since) is known: the
++        // listener saw it and may have chosen the way back; a finish arriving after the phone played on is newer again
++        val newer = if (finished) !(known && parkedAt > playingSinceAt)
++          else !known && (if (sentMs != null) kotlin.math.abs(serverMs - sentMs) > 2000 else progress.lastUpdate > baselineAt + 2000)
+         if (!newer || kotlin.math.abs(serverMs - hereMs) < 30_000L) {
+-          cb?.invoke(false)
++          cb?.invoke(true, false)
++          return@post
++        }
++        // Has the listener taken over since playback started (a jump, a chapter, a scrub)? Then offer, do not jump.
++        // Counted from the player's own seek events; the auto-rewind and the app's own seeks are not the listener.
++        // a jump of seconds, the car rewind or a nearby chapter is not taking over: only a move far from where
++        // uninterrupted playback since the (re)start would be by now counts (a scrub, a distant chapter)
++        val expectedMs = playingSinceMs + ((System.currentTimeMillis() - playingSinceAt) * currentPlayer.playbackParameters.speed).toLong()
++        val listenerMoved = currentPlayer.playWhenReady && playingSinceAt > 0 && listenerSeekAt > playingSinceAt && kotlin.math.abs(hereMs - expectedMs) > 60_000L
++        // parked: an earlier reconcile moved the paused player to the server; hereMs is that server position,
++        // not where this phone listened. Keep the phone's last recorded position as the way back.
++        val parked = !currentPlayer.isPlaying && parkedAt > playingSinceAt && listenerSeekAt <= parkedAt
++        val localMs = if (parked) (StreamCache.localStart(session) ?: StreamCache.localPosition(session) ?: hereMs) else hereMs
++        if (!parked) StreamCache.recordPosition(session, hereMs)
++        StreamCache.setCandidates(session, serverMs, localMs)
++        if (listenerMoved) {
++          // the listener stays where they are and knows the server's position: it counts as synced from here on
++          StreamCache.recordSynced(session, serverMs)
++          AbsLogger.info("PlayerNotificationService", "reconcile ($reason): the server is at ${serverMs / 1000} s (newer), but the listener moved to ${hereMs / 1000} s: offering, not jumping")
++          StreamCache.prebuffer(session, listOf(serverMs), "reconcile", delayMs = 2000)
++          clientEventEmitter?.onPositions(serverMs, localMs, true)
++          mediaSessionConnector.invalidateMediaSessionPlaybackState() // the car button appears
++          cb?.invoke(true, false)
+           return@post
+         }
+-        AbsLogger.info("PlayerNotificationService", "reconcile ($reason): the server is at ${serverMs / 1000} s (newer than this phone's sync), this phone at ${hereMs / 1000} s: continuing from the server")
+-        StreamCache.recordPosition(itemId, hereMs)
+-        StreamCache.setCandidates(session, serverMs, hereMs)
++        AbsLogger.info("PlayerNotificationService", "reconcile ($reason): the server is at ${serverMs / 1000} s (newer than this phone's record), this phone at ${localMs / 1000} s: continuing from the server")
++        val playing = currentPlayer.playWhenReady // not isPlaying: a seek masks the state as buffering for a moment
++        PlayerListener.internalSeekPending = true
+         seekPlayer(serverMs)
+-        StreamCache.prebuffer(session, listOf(serverMs, hereMs), "reconcile", delayMs = 2000)
+-        clientEventEmitter?.onPositions(serverMs, hereMs)
+-        cb?.invoke(true)
++        if (playing) {
++          StreamCache.recordSynced(session, serverMs) // this phone continues from the server's position
++          StreamCache.recordPosition(session, serverMs) // and it is this phone's position from now on; the way back stays in the candidates
++          playingSinceAt = System.currentTimeMillis()
++          playingSinceMs = serverMs
++        } else {
++          parkedAt = System.currentTimeMillis() // synced record untouched: this phone has not continued from here
++        }
++        // the player now loads ahead of the server position itself; keep this phone's window too
++        StreamCache.prebuffer(session, listOf(localMs), "reconcile", delayMs = 2000)
++        clientEventEmitter?.onPositions(serverMs, localMs, false)
++        mediaSessionConnector.invalidateMediaSessionPlaybackState() // the car button appears
++        cb?.invoke(true, true)
+       }
+     }
+   }
+ 
+   fun pause() {
++    startCancelled = true // a start still waiting for the server check must not fire after this
++    pendingStart?.let { android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(it) }
++    pendingStart = null
+     currentPlayer.pause()
+   }
+ 
+@@ -1043,14 +1427,18 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     val session = currentPlaybackSession ?: return
+     if (isClosed || currentPlayer.playbackState == Player.STATE_IDLE) return
+     val position = getCurrentTime()
+-    StreamCache.recordPosition(session.libraryItemId, position)
++    StreamCache.recordPosition(session, position)
+     if (session.isLocal || !session.isDirectPlay || currentPlayer != mPlayer) return
+     val others = StreamCache.candidates(session).filter { kotlin.math.abs(it - position) > 90_000L }
+     if (others.isNotEmpty()) StreamCache.prebuffer(session, others, reason, delayMs = 3000)
++    StreamCache.learnAudioStart(session, position) // after prebuffer: its cancel interrupts the worker first
+   }
+ 
++  // Release Radar fork: a start waiting for the server check counts as playing for every toggle
++  fun isPlayingOrStarting(): Boolean = currentPlayer.isPlaying || pendingStart != null
++
+   fun playPause(): Boolean {
+-    return if (currentPlayer.isPlaying) {
++    return if (isPlayingOrStarting()) {
+       pause()
+       false
+     } else {
+@@ -1059,6 +1447,18 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+     }
+   }
+ 
++  // Release Radar fork: nothing posted for a held start or a retry may fire after the session is gone
++  private fun cancelHeldStart() {
++    reconcileGen++ // an answer still in flight from the cancelled chain stops at the generation check
++    val main = android.os.Handler(android.os.Looper.getMainLooper())
++    main.removeCallbacks(reconcileRetry)
++    pendingStart?.let { main.removeCallbacks(it) }
++    pendingStart = null
++    firstAttemptCb = null
++    startCancelled = true
++    holdServerSync = false
++  }
++
+   fun seekPlayer(time: Long) {
+     var timeToSeek = time
+     Log.d(tag, "seekPlayer mediaCount = ${currentPlayer.mediaItemCount} | $timeToSeek")
+@@ -1115,6 +1515,14 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+ 
+   fun closePlayback(calledOnError: Boolean? = false) {
+     Log.d(tag, "closePlayback")
++    // Release Radar fork: while the server's position is still unknown, this phone's is unconfirmed: keep it
++    // locally as the way back, but neither push nor save it as synced
++    val held = holdServerSync
++    currentPlaybackSession?.let {
++      // a paused player a reconcile only parked at the server position keeps this phone's earlier position (same rule as onDestroy)
++      if (currentPlayer.playbackState != Player.STATE_IDLE && parkedAt <= playingSinceAt) StreamCache.recordPosition(it, getCurrentTime())
++    }
++    cancelHeldStart()
+     val config = DeviceManager.serverConnectionConfig
+ 
+     val isLocal = mediaProgressSyncer.currentIsLocal
+@@ -1123,7 +1531,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
+       Log.i(tag, "About to close playback so stopping media progress syncer first")
+ 
+       mediaProgressSyncer.stop(
+-              calledOnError == false
++              calledOnError == false && !held
+       ) { // If closing on error then do not sync progress (causes exception)
+         Log.d(tag, "Media Progress syncer stopped")
+         // If not local session then close on server
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt b/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt
+index 5dd2426..041d65b 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/player/StreamCache.kt
+@@ -4,8 +4,11 @@ import android.content.Context
+ import android.content.SharedPreferences
+ import android.net.ConnectivityManager
+ import android.util.Log
++import android.net.Uri
+ import com.audiobookshelf.app.data.AudioTrack
++import com.audiobookshelf.app.data.Book
+ import com.audiobookshelf.app.data.PlaybackSession
++import com.audiobookshelf.app.data.Podcast
+ import com.audiobookshelf.app.device.DeviceManager
+ import com.audiobookshelf.app.plugins.AbsLogger
+ import com.audiobookshelf.app.server.AbsHttp
+@@ -52,7 +55,8 @@ object StreamCache {
+   private const val MAX_BYTES = 768L * 1024 * 1024
+   private const val BEHIND_S = 60.0
+   private const val AHEAD_S = 600.0
+-  private const val STARTUP_MAX_AGE_MS = 24L * 3600 * 1000
++  private const val STARTUP_MAX_AGE_MS = 7L * 24 * 3600 * 1000 // the file URL fallback makes the old session irrelevant
++  private const val END_MARGIN_MS = 5_000L // the same "finished" rule as preparePlayer and the server
+   private const val SAME_WINDOW_MS = 90_000L
+   private const val POSITIONS_KEPT = 12
+   private const val NO_PROGRESS_MS = 20_000L
+@@ -62,12 +66,16 @@ object StreamCache {
+   private var appContext: Context? = null
+   private val keys = ConcurrentHashMap<String, String>()
+   private val audioStarts = ConcurrentHashMap<String, Long>()
++  private val audioLens = ConcurrentHashMap<String, Long>()
+   private val executor = Executors.newSingleThreadScheduledExecutor { r ->
+     Thread(r, "stream-prebuffer").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
+   }
+   private val watchdog = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "stream-prebuffer-watchdog").apply { isDaemon = true } }
+   @Volatile private var task: Future<*>? = null
++  @Volatile private var worker: Thread? = null
+   @Volatile private var writer: CacheWriter? = null
++  /** Set by the player service: asks the server where a book is (ms), null when unknown. */
++  @Volatile var progressFetcher: ((itemId: String, episodeId: String?, cb: (Long?) -> Unit) -> Unit)? = null
+   @Volatile private var generation = 0
+   @Volatile private var upstream: DataSource.Factory? = null
+ 
+@@ -88,12 +96,29 @@ object StreamCache {
+       val dir = File(ctx.filesDir, "stream-cache")
+       cache = SimpleCache(dir, LeastRecentlyUsedCacheEvictor(MAX_BYTES), StandaloneDatabaseProvider(ctx))
+       prefs = ctx.getSharedPreferences("stream-cache", Context.MODE_PRIVATE)
++      executor.execute { pruneAudioStarts() }
+       AbsLogger.info(tag, "init: ${(cache?.cacheSpace ?: 0) / 1048576} MB cached, limit ${MAX_BYTES / 1048576} MB")
+     } catch (e: Exception) {
+       AbsLogger.error(tag, "init failed, streaming without a cache: ${e.javaClass.simpleName} ${e.message}")
+     }
+   }
+ 
++  /** audioStart:/audioLen: entries outlive the bytes the LRU evicts: drop those whose file has nothing cached any more. */
++  private fun pruneAudioStarts() {
++    val p = prefs ?: return
++    val c = cache ?: return
++    try {
++      val stale = p.all.keys.filter { (it.startsWith("audioStart:") || it.startsWith("audioLen:")) && c.getCachedSpans(it.substringAfter(':')).isEmpty() }
++      if (stale.isNotEmpty()) {
++        val e = p.edit()
++        stale.forEach { e.remove(it) }
++        e.apply()
++      }
++    } catch (e: Exception) {
++      Log.w(tag, "prune: ${e.message}")
++    }
++  }
++
+   private fun stripToken(uri: String): String {
+     val q = uri.indexOf("?token=")
+     return if (q >= 0) uri.substring(0, q) else uri
+@@ -126,15 +151,24 @@ object StreamCache {
+     cm?.isActiveNetworkMetered ?: false
+   } catch (_: Exception) { false }
+ 
+-  // ---- the positions of this phone, per library item ----
++  // ---- the positions of this phone, per library item (and episode) ----
++
++  private fun positionKey(session: PlaybackSession): String? {
++    val id = session.libraryItemId ?: return null
++    val ep = session.episodeId
++    return if (ep.isNullOrEmpty()) id else "$id#$ep"
++  }
+ 
+   @Synchronized
+-  fun recordPosition(itemId: String?, positionMs: Long) {
++  fun recordPosition(session: PlaybackSession, positionMs: Long) {
+     val p = prefs ?: return
+-    if (itemId.isNullOrEmpty() || positionMs < 0) return
++    val itemId = positionKey(session) ?: return
++    if (positionMs < 0) return
++    // a finished book starts over next time: the end is stored as the start on every path
++    val ms = if (session.duration > 0 && positionMs > (session.duration * 1000).toLong() - END_MARGIN_MS) 0L else positionMs
+     try {
+       val all = JSONObject(p.getString("positions", "{}") ?: "{}")
+-      all.put(itemId, JSONObject().put("ms", positionMs).put("at", System.currentTimeMillis()))
++      all.put(itemId, JSONObject().put("ms", ms).put("at", System.currentTimeMillis()))
+       if (all.length() > POSITIONS_KEPT) {
+         val oldest = all.keys().asSequence().minByOrNull { all.getJSONObject(it).optLong("at") }
+         if (oldest != null) all.remove(oldest)
+@@ -146,14 +180,53 @@ object StreamCache {
+   }
+ 
+   @Synchronized
+-  fun localPosition(itemId: String?): Long? {
++  fun localPosition(session: PlaybackSession): Long? {
+     val p = prefs ?: return null
+-    if (itemId.isNullOrEmpty()) return null
++    val itemId = positionKey(session) ?: return null
+     return try {
+       JSONObject(p.getString("positions", "{}") ?: "{}").optJSONObject(itemId)?.optLong("ms")
+     } catch (e: Exception) { null }
+   }
+ 
++  /** The position the server last accepted FROM THIS PHONE (session start or a successful sync). */
++  @Synchronized
++  fun recordSynced(session: PlaybackSession, positionMs: Long) {
++    val p = prefs ?: return
++    val itemId = positionKey(session) ?: return
++    try {
++      val all = JSONObject(p.getString("synced", "{}") ?: "{}")
++      all.remove(itemId) // re-insert at the end, so the first key is the least recently synced
++      all.put(itemId, positionMs)
++      if (all.length() > POSITIONS_KEPT) {
++        val first = all.keys().asSequence().firstOrNull()
++        if (first != null && first != itemId) all.remove(first)
++      }
++      p.edit().putString("synced", all.toString()).apply()
++    } catch (e: Exception) {
++      Log.w(tag, "recordSynced: ${e.message}")
++    }
++  }
++
++  @Synchronized
++  fun syncedPosition(session: PlaybackSession): Long? {
++    val p = prefs ?: return null
++    val itemId = positionKey(session) ?: return null
++    return try {
++      val all = JSONObject(p.getString("synced", "{}") ?: "{}")
++      if (all.has(itemId)) all.getLong(itemId) else null
++    } catch (e: Exception) { null }
++  }
++
++  /** When this phone last recorded a position for the book (ms since epoch), null if never. */
++  @Synchronized
++  fun localPositionAt(session: PlaybackSession): Long? {
++    val p = prefs ?: return null
++    val itemId = positionKey(session) ?: return null
++    return try {
++      JSONObject(p.getString("positions", "{}") ?: "{}").optJSONObject(itemId)?.optLong("at")?.takeIf { it > 0 }
++    } catch (e: Exception) { null }
++  }
++
+   /** Remember the two positions that matter for this session. */
+   fun setCandidates(session: PlaybackSession, syncedMs: Long, localMs: Long?) {
+     candidateSessionId = session.id
+@@ -170,9 +243,33 @@ object StreamCache {
+ 
+   // ---- where the audio starts in the file ----
+ 
++  /**
++   * A stream URL that does not depend on a server session: the library file itself. Used when the
++   * session the URLs came from is gone (server restart, 36 h cleanup). Same cache key either way.
++   */
++  private fun fileUri(session: PlaybackSession, track: AudioTrack): Uri? {
++    val base = session.serverAddress?.trimEnd('/') ?: return null
++    val itemId = session.libraryItemId ?: return null
++    val rel = track.metadata?.relPath ?: return null
++    val ino = when (val media = session.libraryItem?.media) {
++      is Book -> media.audioFiles?.firstOrNull { it.metadata.relPath == rel }?.ino
++      is Podcast -> media.episodes?.firstOrNull { it.audioFile?.metadata?.relPath == rel }?.audioFile?.ino
++      else -> null
++    } ?: return null
++    val token = DeviceManager.token
++    if (token.isEmpty()) return null
++    val uri = Uri.parse("$base/api/items/$itemId/file/$ino?token=$token")
++    keys[stripToken(uri.toString())] = key(session, track)
++    return uri
++  }
++
+   private fun readAt(ds: DataSource, session: PlaybackSession, track: AudioTrack, position: Long, length: Int): ByteArray? {
+-    val spec = DataSpec.Builder().setUri(session.getContentUri(track)).setPosition(position).setLength(length.toLong())
+-      .setKey(key(session, track)).build()
++    return readAt(ds, session.getContentUri(track), key(session, track), position, length)
++      ?: fileUri(session, track)?.let { readAt(ds, it, key(session, track), position, length) }
++  }
++
++  private fun readAt(ds: DataSource, uri: Uri, key: String, position: Long, length: Int): ByteArray? {
++    val spec = DataSpec.Builder().setUri(uri).setPosition(position).setLength(length.toLong()).setKey(key).build()
+     return try {
+       ds.open(spec)
+       val buf = ByteArray(length)
+@@ -199,31 +296,68 @@ object StreamCache {
+    * the top-level boxes (a few 16-byte reads, served from the cache once the
+    * player has opened the file). Other formats start at 0.
+    */
+-  private fun audioStart(session: PlaybackSession, track: AudioTrack, c: SimpleCache): Long {
++  private fun isMp4(track: AudioTrack): Boolean {
+     val ext = (track.metadata?.ext ?: "").lowercase().trimStart('.')
+-    if (ext !in setOf("m4b", "m4a", "mp4", "aac") && !(track.mimeType ?: "").contains("mp4")) return 0L
++    return ext in setOf("m4b", "m4a", "mp4", "aac") || (track.mimeType ?: "").contains("mp4")
++  }
++
++  private fun audioStart(session: PlaybackSession, track: AudioTrack, c: SimpleCache): Long {
++    if (!isMp4(track)) return 0L
+     val k = key(session, track)
+     audioStarts[k]?.let { return it }
++    try { prefs?.getLong("audioStart:$k", -1L)?.takeIf { it >= 0 }?.let { audioStarts[k] = it; return it } } catch (_: Exception) {}
+     val size = track.metadata?.size ?: return 0L
+-    val ds = CacheDataSource.Factory().setCache(c).setUpstreamDataSourceFactory(upstream ?: OkHttpDataSource.Factory(AbsHttp.client))
++    val ds = CacheDataSource.Factory().setCache(c).setUpstreamDataSourceFactory(upstream ?: OkHttpDataSource.Factory(AbsHttp.playerClient))
+       .setCacheKeyFactory(keyFactory).setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR).createDataSource()
+     var off = 0L
+     var found = 0L
++    var foundLen = 0L
+     for (i in 0 until 12) {
+-      val hdr = readAt(ds, session, track, off, 16) ?: break
++      val hdr = readAt(ds, session, track, off, 16)
++        ?: return 0L // a read failed (offline, timeout, cancelled): remember nothing, walk again next time
+       if (hdr.size < 8) break
+       var boxSize = u32(hdr, 0)
+       val type = String(hdr, 4, 4, Charsets.ISO_8859_1)
+       if (boxSize == 1L && hdr.size >= 16) boxSize = (u32(hdr, 8) shl 32) or u32(hdr, 12)
+       if (boxSize == 0L) boxSize = size - off
+-      if (type == "mdat") { found = off; break }
++      if (type == "mdat") { found = off; foundLen = boxSize; break }
+       if (boxSize < 8 || off + boxSize >= size) break
+       off += boxSize
+     }
+     audioStarts[k] = found
++    if (foundLen > 0) audioLens[k] = foundLen
++    try {
++      prefs?.edit()?.putLong("audioStart:$k", found)?.apply()
++      if (foundLen > 0) prefs?.edit()?.putLong("audioLen:$k", foundLen)?.apply()
++    } catch (_: Exception) {}
+     return found
+   }
+ 
++  /** The audio bytes of the track (the mdat box when known), for the time -> byte estimate. */
++  private fun audioBytes(k: String, size: Long, header: Long): Long {
++    val len = audioLens[k] ?: try { prefs?.getLong("audioLen:$k", -1L)?.takeIf { it > 0 }?.also { audioLens[k] = it } } catch (_: Exception) { null }
++    return (len ?: (size - header)).coerceIn(1L, size)
++  }
++
++  /** True when a start at [positionMs] needs nothing from the server: the index and 30 s of audio are on disk. */
++  fun isWarm(session: PlaybackSession, positionMs: Long): Boolean {
++    val c = cache ?: return false
++    if (session.isLocal || !session.isDirectPlay) return false
++    val track = session.audioTracks.firstOrNull { positionMs >= it.startOffsetMs && positionMs < it.endOffsetMs } ?: return false
++    val size = track.metadata?.size ?: return false
++    if (size <= 0 || track.duration <= 0) return false
++    val k = key(session, track)
++    val header = if (!isMp4(track)) 0L else audioStarts[k] ?: try { prefs?.getLong("audioStart:$k", -1L) ?: -1L } catch (_: Exception) { -1L }
++    if (header < 0) return false // never opened on this phone
++    if (header > 0 && c.getCachedBytes(k, 0, header) < header) return false
++    val bytesPerSecond = audioBytes(k, size, header) / track.duration
++    val trackPosS = (positionMs - track.startOffsetMs) / 1000.0
++    val from = header + (trackPosS * bytesPerSecond).toLong()
++    val need = (30 * bytesPerSecond).toLong().coerceAtMost(size - from)
++    if (need <= 0) return false
++    return c.getCachedBytes(k, from, need) >= need
++  }
++
+   // ---- the pre-buffer ----
+ 
+   private data class Window(val track: AudioTrack, val from: Long, val to: Long, val aroundMs: Long)
+@@ -234,7 +368,7 @@ object StreamCache {
+     val size = track.metadata?.size ?: return null
+     if (size <= 0 || track.duration <= 0) return null
+     val header = audioStart(session, track, c).coerceIn(0L, size)
+-    val bytesPerSecond = (size - header) / track.duration
++    val bytesPerSecond = audioBytes(key(session, track), size, header) / track.duration
+     val trackPosS = (positionMs - track.startOffsetMs) / 1000.0
+     val from = header + ((trackPosS - BEHIND_S).coerceAtLeast(0.0) * bytesPerSecond).toLong()
+     val to = (header + ((trackPosS + AHEAD_S) * bytesPerSecond).toLong()).coerceAtMost(size)
+@@ -259,10 +393,14 @@ object StreamCache {
+     val gen = ++generation
+     cancelRunning()
+     task = executor.schedule({
+-      if (metered()) { Log.d(tag, "prebuffer ($reason): metered network, skipped"); return@schedule }
++      worker = Thread.currentThread()
++      Thread.interrupted() // a stale interrupt from an earlier watchdog must not kill this job
+       val distinct = mutableListOf<Long>()
+       positionsMs.forEach { p -> if (distinct.none { abs(it - p) < SAME_WINDOW_MS }) distinct.add(p) }
++      // window() learns and persists where the audio starts (a few 16-byte reads, served from the cache once the
++      // player has opened the file): isWarm needs that on every network, only the download below is Wi-Fi-only
+       val windows = distinct.mapNotNull { window(session, it, c) }
++      if (metered()) { Log.d(tag, "prebuffer ($reason): metered network, windows not downloaded"); return@schedule }
+       for (w in windows) {
+         if (gen != generation || Thread.currentThread().isInterrupted) return@schedule
+         val key = key(session, w.track)
+@@ -272,49 +410,78 @@ object StreamCache {
+           Log.d(tag, "prebuffer ($reason): window at ${w.aroundMs / 1000} s already cached")
+           continue
+         }
+-        val ds = CacheDataSource.Factory()
+-          .setCache(c)
+-          .setUpstreamDataSourceFactory(upstream ?: OkHttpDataSource.Factory(AbsHttp.client))
+-          .setCacheKeyFactory(keyFactory)
+-          .createDataSourceForDownloading()
+-        val spec = DataSpec.Builder().setUri(session.getContentUri(w.track)).setPosition(w.from).setLength(wanted).setKey(key).build()
+-        var progressAt = System.currentTimeMillis()
+-        val cw = CacheWriter(ds, spec, null) { _, _, _ -> progressAt = System.currentTimeMillis() }
+-        writer = cw
+-        val me = task
+-        val guard = watchdog.scheduleWithFixedDelay({
+-          if (System.currentTimeMillis() - progressAt > NO_PROGRESS_MS) {
+-            Log.d(tag, "prebuffer ($reason): no progress for ${NO_PROGRESS_MS / 1000} s, giving up on this window")
+-            cw.cancel()
+-            me?.cancel(true)
+-          }
+-        }, NO_PROGRESS_MS, 5000, TimeUnit.MILLISECONDS)
+-        val t0 = System.currentTimeMillis()
+-        try {
+-          cw.cache()
+-          AbsLogger.info(tag, "prebuffer ($reason): ${(wanted - have) / 1024} KB around ${w.aroundMs / 1000} s of " +
+-            "${session.displayTitle} in ${System.currentTimeMillis() - t0} ms")
+-        } catch (e: InterruptedIOException) {
+-          Log.d(tag, "prebuffer ($reason) cancelled")
+-          return@schedule
+-        } catch (e: HttpDataSource.InvalidResponseCodeException) {
+-          Log.d(tag, "prebuffer ($reason): server answered ${e.responseCode} (session gone?)")
+-          return@schedule
+-        } catch (e: Exception) {
+-          if (Thread.currentThread().isInterrupted) return@schedule
+-          AbsLogger.error(tag, "prebuffer ($reason) failed: ${e.javaClass.simpleName} ${e.message?.take(160)}")
+-          return@schedule
+-        } finally {
+-          guard.cancel(false)
+-          if (writer === cw) writer = null
++        var outcome = writeWindow(c, session, w, session.getContentUri(w.track), key, have, reason, gen)
++        if (outcome == "notfound") {
++          // the session the URL came from is gone: the library file itself serves the same bytes
++          val alt = fileUri(session, w.track)
++          if (alt != null) outcome = writeWindow(c, session, w, alt, key, have, reason, gen)
++          if (outcome == "notfound") AbsLogger.info(tag, "prebuffer ($reason): the server has no stream for ${session.displayTitle} any more; it will be fetched on play")
++        }
++        when (outcome) {
++          "cancelled", "failed", "notfound" -> return@schedule
++          else -> continue
+         }
+       }
+     }, delayMs, TimeUnit.MILLISECONDS)
+   }
+ 
++  /** One window through the cache writer: "ok" | "skipped" | "cancelled" | "notfound" | "failed". */
++  private fun writeWindow(c: SimpleCache, session: PlaybackSession, w: Window, uri: Uri, key: String, have: Long, reason: String, gen: Int): String {
++    val wanted = w.to - w.from
++    val ds = CacheDataSource.Factory()
++      .setCache(c)
++      .setUpstreamDataSourceFactory(upstream ?: OkHttpDataSource.Factory(AbsHttp.playerClient))
++      .setCacheKeyFactory(keyFactory)
++      .createDataSourceForDownloading()
++    val spec = DataSpec.Builder().setUri(uri).setPosition(w.from).setLength(wanted).setKey(key).build()
++    var progressAt = System.currentTimeMillis()
++    val cw = CacheWriter(ds, spec, null) { _, _, _ -> progressAt = System.currentTimeMillis() }
++    writer = cw
++    val me = worker
++    val guard = watchdog.scheduleWithFixedDelay({
++      if (System.currentTimeMillis() - progressAt > NO_PROGRESS_MS) {
++        Log.d(tag, "prebuffer ($reason): no progress for ${NO_PROGRESS_MS / 1000} s, skipping this window")
++        cw.cancel()
++        me?.interrupt() // wakes a wait on the player's cache lock; the loop goes on with the next window
++      }
++    }, NO_PROGRESS_MS, 5000, TimeUnit.MILLISECONDS)
++    val t0 = System.currentTimeMillis()
++    try {
++      cw.cache()
++      AbsLogger.info(tag, "prebuffer ($reason): ${(wanted - have) / 1024} KB around ${w.aroundMs / 1000} s of " +
++        "${session.displayTitle} in ${System.currentTimeMillis() - t0} ms")
++      return "ok"
++    } catch (e: InterruptedIOException) {
++      Thread.interrupted()
++      if (gen != generation) { Log.d(tag, "prebuffer ($reason) cancelled"); return "cancelled" }
++      return "skipped" // the watchdog gave up on this window only
++    } catch (e: HttpDataSource.InvalidResponseCodeException) {
++      Log.d(tag, "prebuffer ($reason): server answered ${e.responseCode} for ${uri.path}")
++      return if (e.responseCode == 404 || e.responseCode == 403) "notfound" else "failed"
++    } catch (e: Exception) {
++      if (Thread.interrupted() || gen != generation) return "cancelled"
++      AbsLogger.error(tag, "prebuffer ($reason) failed: ${e.javaClass.simpleName} ${e.message?.take(160)}")
++      return "failed"
++    } finally {
++      guard.cancel(false)
++      if (writer === cw) writer = null
++    }
++  }
++
+   fun prebuffer(session: PlaybackSession, positionMs: Long, reason: String, delayMs: Long = 0) =
+     prebuffer(session, listOf(positionMs), reason, delayMs)
+ 
++  /** Learn where the audio starts in the track at [positionMs], on any network: isWarm needs it to start from the phone. */
++  fun learnAudioStart(session: PlaybackSession, positionMs: Long) {
++    val c = cache ?: return
++    if (session.isLocal || !session.isDirectPlay) return
++    val track = session.audioTracks.firstOrNull { positionMs >= it.startOffsetMs && positionMs < it.endOffsetMs } ?: return
++    if (!isMp4(track) || audioStarts.containsKey(key(session, track))) return
++    executor.execute {
++      try { audioStart(session, track, c) } catch (_: Exception) {}
++    }
++  }
++
+   /**
+    * At service start and when the server config is set: warm the windows of
+    * the last streamed book before anyone presses play (only if this phone
+@@ -323,20 +490,31 @@ object StreamCache {
+   fun prebufferLastSession(reason: String) {
+     val s = DeviceManager.deviceData.lastPlaybackSession ?: return
+     if (s.isLocal || !s.isDirectPlay) return
+-    if (s.serverConnectionConfigId != DeviceManager.serverConnectionConfigId) return
++    if (!DeviceManager.adoptSavedConfig(s.serverConnectionConfigId)) return
+     val p = prefs
+     val at = try { p?.getLong("at", 0L) ?: 0L } catch (_: Exception) { 0L }
+     if (System.currentTimeMillis() - at > STARTUP_MAX_AGE_MS) return
+     val positions = mutableListOf<Long>()
+     try { if (p?.getString("sessionId", null) == s.id) positions.add(p.getLong("positionMs", s.currentTimeMs)) } catch (_: Exception) {}
+-    localPosition(s.libraryItemId)?.let { positions.add(it) }
++    localPosition(s)?.let { positions.add(it) }
+     positions.add(s.currentTimeMs)
+-    prebuffer(s, positions, reason)
++    // another device may have moved the book: ask, and cache that window first
++    val fetch = progressFetcher
++    val itemId = s.libraryItemId
++    if (fetch != null && itemId != null) {
++      fetch(itemId, s.episodeId) { serverMs ->
++        if (serverMs != null) positions.add(0, serverMs)
++        prebuffer(s, positions, reason)
++      }
++    } else {
++      prebuffer(s, positions, reason)
++    }
+   }
+ 
+   private fun cancelRunning() {
+     writer?.cancel()
+-    task?.cancel(true)
++    worker?.interrupt()
++    task?.cancel(false)
+   }
+ 
+   fun cancel() {
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt
+index 6df9d76..6539eb3 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsAudioPlayer.kt
+@@ -115,10 +115,11 @@ class AbsAudioPlayer : Plugin() {
+           emit("onPlaybackSpeedChanged", playbackSpeed)
+         }
+ 
+-        override fun onPositions(syncedMs: Long, localMs: Long) { // Release Radar fork
++        override fun onPositions(syncedMs: Long, localMs: Long, atLocal: Boolean) { // Release Radar fork
+           val o = JSObject()
+           o.put("syncedMs", syncedMs)
+           o.put("localMs", localMs)
++          o.put("atLocal", atLocal)
+           notifyListeners("onPositions", o)
+         }
+       })
+@@ -277,10 +278,21 @@ class AbsAudioPlayer : Plugin() {
+       val playItemRequestPayload = playerNotificationService.getPlayItemRequestPayload(false)
+       Handler(Looper.getMainLooper()).post {
+         playerNotificationService.mediaProgressSyncer.stop {
++          // Release Radar fork: the last book starts from the phone; the server is asked for its position afterwards
++          val resumed = if (startTimeOverride == null) playerNotificationService.resumableLastSession(libraryItemId, episodeId.ifEmpty { null }) else null
++          if (resumed != null) {
++            Handler(Looper.getMainLooper()).post {
++              PlayerListener.lazyIsPlaying = false
++              playerNotificationService.preparePlayer(resumed, playWhenReady, playbackRate)
++            }
++            call.resolve(JSObject(jacksonMapper.writeValueAsString(resumed)))
++            return@stop
++          }
+           apiHandler.playLibraryItem(libraryItemId, episodeId, playItemRequestPayload) {
+             if (it == null) {
+               call.resolve(JSObject("{\"error\":\"Server play request failed\"}"))
+             } else {
++              val serverStartMs = it.currentTimeMs // Release Radar fork: where the server holds the book, before any override
+               if (startTimeOverride != null) {
+                 Log.d(tag, "prepareLibraryItem: Using start time override $startTimeOverride")
+                 it.currentTime = startTimeOverride
+@@ -289,7 +301,7 @@ class AbsAudioPlayer : Plugin() {
+               Handler(Looper.getMainLooper()).post {
+                 Log.d(tag, "Preparing Player playback session ${jacksonMapper.writeValueAsString(it)}")
+                 PlayerListener.lazyIsPlaying = false
+-                playerNotificationService.preparePlayer(it, playWhenReady, playbackRate)
++                playerNotificationService.preparePlayer(it, playWhenReady, playbackRate, if (startTimeOverride != null) serverStartMs else null)
+               }
+               call.resolve(JSObject(jacksonMapper.writeValueAsString(it)))
+             }
+@@ -305,8 +317,14 @@ class AbsAudioPlayer : Plugin() {
+     Handler(Looper.getMainLooper()).post {
+       val ret = JSObject()
+       playerNotificationService.currentPlaybackSession?.let { session ->
+-        com.audiobookshelf.app.player.StreamCache.syncedStart(session)?.let { ret.put("syncedMs", it) }
+-        com.audiobookshelf.app.player.StreamCache.localStart(session)?.let { ret.put("localMs", it) }
++        val synced = com.audiobookshelf.app.player.StreamCache.syncedStart(session)
++        val local = com.audiobookshelf.app.player.StreamCache.localStart(session)
++        synced?.let { ret.put("syncedMs", it) }
++        local?.let { ret.put("localMs", it) }
++        if (synced != null && local != null) {
++          val here = playerNotificationService.getCurrentTime()
++          ret.put("atLocal", kotlin.math.abs(here - local) < kotlin.math.abs(here - synced))
++        }
+       }
+       call.resolve(ret)
+     }
+@@ -316,8 +334,9 @@ class AbsAudioPlayer : Plugin() {
+   @PluginMethod
+   fun reconcileServerProgress(call: PluginCall) {
+     Handler(Looper.getMainLooper()).post {
+-      playerNotificationService.reconcileServerProgress("foreground") { moved ->
++      playerNotificationService.reconcileServerProgress("foreground") { answered, moved ->
+         val ret = JSObject()
++        ret.put("answered", answered)
+         ret.put("moved", moved)
+         call.resolve(ret)
+       }
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
+index 147cc5e..7747442 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsDatabase.kt
+@@ -333,7 +333,11 @@ class AbsDatabase : Plugin() {
+     }
+ 
+     apiHandler.syncLocalMediaProgressForUser {
+-      val savedSessions = DeviceManager.dbManager.getPlaybackSessions().filter { it.serverConnectionConfigId == DeviceManager.serverConnectionConfigId }
++      // Release Radar fork: a session whose server position is still being checked (held syncs) is not uploaded here;
++      // the syncer sends it once the hold ends, or this path does on a later start
++      val svc = if (mainActivity.isPlayerNotificationServiceInitialized()) mainActivity.foregroundService else null
++      val heldId = if (svc?.holdServerSync == true) svc.currentPlaybackSession?.id else null
++      val savedSessions = DeviceManager.dbManager.getPlaybackSessions().filter { it.serverConnectionConfigId == DeviceManager.serverConnectionConfigId && it.id != heldId }
+ 
+       if (savedSessions.isNotEmpty()) {
+         apiHandler.sendSyncLocalSessions(savedSessions) { success, errorMsg ->
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsLogger.kt b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsLogger.kt
+index ababfb5..fce59db 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsLogger.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/plugins/AbsLogger.kt
+@@ -35,6 +35,20 @@ class AbsLogger : Plugin() {
+   companion object {
+     var onLogEmitter:((log:AbsLog) -> Unit)? = null
+ 
++    @Volatile private var crashHandlerInstalled = false // Release Radar fork
++    // Release Radar fork: a crash leaves its stack trace on Settings > Logs for the next launch (once per process)
++    fun installCrashHandler() {
++      if (crashHandlerInstalled) return
++      crashHandlerInstalled = true
++      val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
++      Thread.setDefaultUncaughtExceptionHandler { thread, error ->
++        try {
++          error("Crash", "uncaught ${error.javaClass.name}: ${error.message} on thread ${thread.name}\n" + android.util.Log.getStackTraceString(error).take(6000))
++        } catch (_: Throwable) {}
++        previousHandler?.uncaughtException(thread, error)
++      }
++    }
++
+     fun log(level:String, tag:String, message:String) {
+       val absLog = AbsLog(id = UUID.randomUUID().toString(), tag, level, message, timestamp = System.currentTimeMillis())
+       DeviceManager.dbManager.saveLog(absLog)
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt b/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
+index 4c32734..468c790 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/server/ApiHandler.kt
+@@ -50,9 +50,34 @@ object AbsHttp {
+     }
+   }
+   val client: OkHttpClient = OkHttpClient.Builder().dns(dns).addInterceptor(ServerRoute.interceptor).build()
++
++  // Release Radar fork: the player's URIs keep the token they were built with; send the current one instead,
++  // so a refreshed token does not break a stream that is still open (same pool, same route interceptor)
++  @Volatile var onPlayerUnauthorized: ((sentToken: String) -> Unit)? = null
++  val playerClient: OkHttpClient = client.newBuilder().addInterceptor { chain ->
++    val req = chain.request()
++    val tok = DeviceManager.token
++    val have = req.url.queryParameter("token")
++    val sent = if (tok.isEmpty() || have == null || have == tok) req
++      else req.newBuilder().url(req.url.newBuilder().setQueryParameter("token", tok).build()).build()
++    val res = chain.proceed(sent)
++    // an expired token: refresh it; the player's own retries then carry the new one
++    if (res.code == 401 && have != null) onPlayerUnauthorized?.invoke(sent.url.queryParameter("token") ?: "")
++    res
++  }.build()
+ }
+ 
+ class ApiHandler(var ctx:Context) {
++  init {
++    // Release Radar fork: a 401 on a player request refreshes the token once per token
++    AbsHttp.onPlayerUnauthorized = { sentToken ->
++      val configId = DeviceManager.serverConnectionConfigId
++      if (sentToken.isNotEmpty() && sentToken == DeviceManager.token && configId.isNotEmpty()) {
++        refreshAuthTokens(configId) { Log.d(tag, "player 401: token refresh result $it") }
++      }
++    }
++  }
++
+   val tag = "ApiHandler"
+ 
+   companion object {
+@@ -322,6 +347,7 @@ class ApiHandler(var ctx:Context) {
+         config.token = newAccessToken
+         DeviceManager.dbManager.saveDeviceData(DeviceManager.deviceData)
+         Log.d(tag, "updateTokens: Updated access token in server connection config")
++        ServerRoute.probe("token refreshed", force = true) // Release Radar fork: the home address is proven with the new token
+       }
+ 
+       // Send access token to Webview frontend
+@@ -598,7 +624,7 @@ class ApiHandler(var ctx:Context) {
+     }
+   }
+ 
+-  fun getAllItemsInProgress(cb: (List<ItemInProgress>) -> Unit) {
++  fun getAllItemsInProgress(cb: (List<ItemInProgress>, fromCache: Boolean) -> Unit) {
+     getRequest("/api/me/items-in-progress", null, null) {
+       val items = mutableListOf<ItemInProgress>()
+       if (it.has("libraryItems")) {
+@@ -608,8 +634,33 @@ class ApiHandler(var ctx:Context) {
+           val itemInProgress = ItemInProgress.makeFromServerObject(jsobj, jacksonMapper)
+           items.add(itemInProgress)
+         }
++        // Release Radar fork: keep the list for the next start without the server (Android Auto)
++        try {
++          ctx.getSharedPreferences("auto-cache", Context.MODE_PRIVATE).edit()
++            .putString("itemsInProgress", array.toString())
++            .putString("configId", DeviceManager.serverConnectionConfigId)
++            .putLong("at", System.currentTimeMillis()).apply()
++        } catch (_: Exception) {}
++        cb(items, false)
++      } else {
++        cb(getCachedItemsInProgress(), true) // Release Radar fork: no answer, use what the server said last time
+       }
+-      cb(items)
++    }
++  }
++
++  // Release Radar fork: the "Continue listening" list as the server last sent it
++  fun getCachedItemsInProgress(): List<ItemInProgress> {
++    return try {
++      val prefs = ctx.getSharedPreferences("auto-cache", Context.MODE_PRIVATE)
++      val forConfig = prefs.getString("configId", null)
++      if (forConfig != null && forConfig != DeviceManager.serverConnectionConfigId) return emptyList() // another server's list
++      val raw = prefs.getString("itemsInProgress", null) ?: return emptyList()
++      val array = JSONArray(raw)
++      (0 until array.length()).mapNotNull { i ->
++        try { ItemInProgress.makeFromServerObject(array.getJSONObject(i), jacksonMapper) } catch (e: Exception) { null }
++      }
++    } catch (e: Exception) {
++      emptyList()
+     }
+   }
+ 
+@@ -697,6 +748,21 @@ class ApiHandler(var ctx:Context) {
+     }
+   }
+ 
++  // Release Radar fork: like getMediaProgress, but says whether the server answered with "no record" (404),
++  // which must release a held sync the same way a real answer does
++  fun getMediaProgressOrNone(libraryItemId:String, episodeId:String?, cb: (MediaProgress?, noRecord: Boolean) -> Unit) {
++    val endpoint = if(episodeId.isNullOrEmpty()) "/api/me/progress/$libraryItemId" else "/api/me/progress/$libraryItemId/$episodeId"
++    getRequest(endpoint, pingClient, null) {
++      if (it.has("error")) {
++        val err = it.getString("error") ?: ""
++        cb(null, err.contains("code=404"))
++      } else {
++        val progress = try { jacksonMapper.readValue<MediaProgress>(it.toString()) } catch (e: Exception) { null }
++        cb(progress, progress == null)
++      }
++    }
++  }
++
+   fun getPlaybackSession(playbackSessionId:String, cb: (PlaybackSession?) -> Unit) {
+     Log.d(tag, "getPlaybackSession for $playbackSessionId for server ${DeviceManager.serverAddress}")
+     val endpoint = "/api/session/$playbackSessionId"
+@@ -773,6 +839,8 @@ class ApiHandler(var ctx:Context) {
+ 
+           playbackSessions.find { ps -> ps.id == localSessionSyncResult.id }?.let { session ->
+             if (localSessionSyncResult.progressSynced == true) {
++              // Release Radar fork: this phone's own position, accepted by the server, counts like an acknowledged sync
++              com.audiobookshelf.app.player.StreamCache.recordSynced(session, (session.currentTime * 1000).toLong())
+               val syncResult = SyncResult(true, true, "Progress synced on server")
+               MediaEventManager.saveEvent(session, syncResult)
+ 
+diff --git a/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt b/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
+index 6df0c00..c3671d0 100644
+--- a/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
++++ b/android/app/src/main/java/com/audiobookshelf/app/server/ServerRoute.kt
+@@ -45,6 +45,10 @@ object ServerRoute {
+   private const val CONNECT_MS = 1500L
+   private const val DOWN_HOLD_MS = 30_000L
+   private const val PROBE_MIN_GAP_MS = 10_000L
++  private const val RETRY_MIN_MS = 60_000L
++  private const val RETRY_MAX_MS = 600_000L
++  @Volatile private var retryMs = RETRY_MIN_MS
++  private val netEpoch = java.util.concurrent.atomic.AtomicInteger()
+ 
+   @Volatile var lanOk = false
+     private set
+@@ -118,6 +122,20 @@ object ServerRoute {
+     }
+   }
+ 
++  /** Forget the verified route without a hold: the network changed, prove it again right away. */
++  fun invalidate(why: String) {
++    netEpoch.incrementAndGet() // a probe already running now answers for the old network
++    val was = isLocal()
++    lanOk = false
++    upFor = null
++    downUntil = 0L // a hold earned on the previous network says nothing about this one
++    retryMs = RETRY_MIN_MS // nor does a retry backoff earned there
++    if (was) {
++      Log.i(tag, "home address off: $why")
++      notifyJs()
++    }
++  }
++
+   private fun markUp(forPair: String) {
+     val was = isLocal()
+     lanOk = true
+@@ -137,9 +155,9 @@ object ServerRoute {
+   }
+ 
+   /** Probe soon, coalescing bursts of network events. */
+-  fun probeSoon(reason: String, delayMs: Long = 1500) {
++  fun probeSoon(reason: String, delayMs: Long = 1500, force: Boolean = false) {
+     pending?.cancel(false)
+-    pending = executor.schedule({ probe(reason, force = false) }, delayMs, TimeUnit.MILLISECONDS)
++    pending = executor.schedule({ probe(reason, force) }, delayMs, TimeUnit.MILLISECONDS)
+   }
+ 
+   /** Probe now on the route thread (never on the caller's thread). */
+@@ -156,8 +174,26 @@ object ServerRoute {
+         }
+         if (!force && now - lastProbeAt < PROBE_MIN_GAP_MS && isLocal()) return@execute
+         lastProbeAt = now
++        val epoch = netEpoch.get()
+         val ok = try { sameServerReachable() } catch (e: Exception) { Log.d(tag, "probe ($reason): ${e.javaClass.simpleName} ${e.message}"); false }
+-        if (ok && p == pair()) markUp(p) else markDown("probe ($reason) failed")
++        if (epoch != netEpoch.get()) {
++          // the default network changed while this probe ran: its answer is for the old network
++          Log.d(tag, "probe ($reason): network changed meanwhile, result dropped")
++          return@execute
++        }
++        if (ok && p == pair()) {
++          retryMs = RETRY_MIN_MS
++          markUp(p)
++        } else {
++          markDown("probe ($reason) failed")
++          // the server may simply be restarting: try again, less and less often (1 min .. 10 min),
++          // but never replace a probe a network event or the interceptor queued meanwhile
++          val queued = pending
++          if (queued == null || queued.isDone) {
++            probeSoon("retry", retryMs, force = true)
++            retryMs = (retryMs * 2).coerceAtMost(RETRY_MAX_MS)
++          }
++        }
+       } catch (e: Exception) {
+         Log.w(tag, "probe error: ${e.message}")
+       }
+@@ -202,8 +238,8 @@ object ServerRoute {
+     try {
+       val cm = ctx.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+       cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+-        override fun onAvailable(network: Network) { markDown("network changed"); probeSoon("network available", 500) }
+-        override fun onLost(network: Network) { markDown("network lost"); probeSoon("network lost", 3000) }
++        override fun onAvailable(network: Network) { invalidate("network changed"); probeSoon("network available", 500, force = true) }
++        override fun onLost(network: Network) { invalidate("network lost"); probeSoon("network lost", 3000, force = true) }
+         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+           // Wi-Fi <-> cellular hand-over: re-check straight away
+           probeSoon("network changed")
+@@ -212,7 +248,7 @@ object ServerRoute {
+     } catch (e: Exception) {
+       Log.w(tag, "could not register network callback: ${e.message}")
+     }
+-    probeSoon("start", 500)
++    probeSoon("start", 500, force = true)
+   }
+ 
+   /** Only a failure to reach the home address says anything about the route. */
+diff --git a/components/app/AudioPlayer.vue b/components/app/AudioPlayer.vue
+index 3aca868..e6d5648 100644
+--- a/components/app/AudioPlayer.vue
++++ b/components/app/AudioPlayer.vue
+@@ -188,7 +188,9 @@ export default {
+       titleMarquee: null,
+       isRefreshingUI: false,
+       positions: null, // Release Radar fork: { syncedMs, localMs } when this phone was somewhere else
+-      atLocalPosition: false
++      atLocalPosition: false,
++      positionToastId: null,
++      positionToastKey: null
+     }
+   },
+   watch: {
+@@ -437,24 +439,66 @@ export default {
+     }
+   },
+   methods: {
+-    // Release Radar fork: the player moved to the synced position; this phone was somewhere else
++    // Release Radar fork: one tappable notice at a time; tapping it jumps, the player menu keeps both positions
++    jumpToPosition(ms) {
++      if (!this.positions || this.showLoadingState || this.seekLoading) return
++      this.positionToastKey = null // a later move away from the chosen position is announced again
++      this.atLocalPosition = Math.abs(ms - this.positions.localMs) < 1000
++      if (this.positionToastId != null) {
++        try {
++          this.$toast.dismiss(this.positionToastId)
++        } catch (e) {}
++        this.positionToastId = null
++      }
++      this.seek(ms / 1000)
++    },
++    showPositionNotice(text, targetMs, key) {
++      if (this.positionToastKey === key) return
++      this.positionToastKey = key
++      if (this.positionToastId != null) {
++        try {
++          this.$toast.dismiss(this.positionToastId)
++        } catch (e) {}
++      }
++      this.positionToastId = this.$toast.info(text, {
++        timeout: 8000,
++        closeOnClick: true,
++        onClick: () => this.jumpToPosition(targetMs),
++        onClose: () => {
++          this.positionToastId = null
++        }
++      })
++    },
++    // the player moved to the synced position (or stayed, and offers it); this phone was somewhere else
+     onPositions(p) {
+       if (!p || p.localMs == null || p.syncedMs == null) return
+       this.positions = { syncedMs: p.syncedMs, localMs: p.localMs }
+-      this.atLocalPosition = false
+-      this.$toast.info(`Continuing from the synced position. This phone was at ${this.$secondsToTimestamp(p.localMs / 1000)}; the menu takes you back.`, { timeout: 6000 })
+-    },
+-    onDeviceFocus(hasFocus) {
+-      if (hasFocus && this.playbackSession && !this.isPlaying) AbsAudioPlayer.reconcileServerProgress().catch(() => {})
++      this.atLocalPosition = !!p.atLocal
++      const synced = this.$secondsToTimestamp(p.syncedMs / 1000)
++      const local = this.$secondsToTimestamp(p.localMs / 1000)
++      if (p.atLocal) {
++        this.showPositionNotice(`Another device reached ${synced}. Tap to go there.`, p.syncedMs, `offer:${p.syncedMs}`)
++      } else {
++        this.showPositionNotice(`Moved to the synced position ${synced}. Tap to go back to ${local}.`, p.localMs, `moved:${p.localMs}`)
++      }
+     },
+     // Release Radar fork: did this session start at a synced position far from where this phone was?
+-    async loadPositions() {
++    async loadPositions(sameBook) {
++      if (sameBook && this.positions) return // a renewed server session for the same book: nothing new started
+       this.positions = null
+       this.atLocalPosition = false
++      this.positionToastKey = null
+       const p = await AbsAudioPlayer.getPositions().catch(() => null)
+       if (p && p.localMs != null && p.syncedMs != null && Math.abs(p.localMs - p.syncedMs) > 30000) {
+-        this.positions = p
+-        this.$toast.info(`This phone was at ${this.$secondsToTimestamp(p.localMs / 1000)}. The menu takes you back.`, { timeout: 6000 })
++        this.positions = { syncedMs: p.syncedMs, localMs: p.localMs }
++        this.atLocalPosition = !!p.atLocal
++        const synced = this.$secondsToTimestamp(p.syncedMs / 1000)
++        const local = this.$secondsToTimestamp(p.localMs / 1000)
++        if (p.atLocal) {
++          this.showPositionNotice(`Started where this phone was, ${local}. Tap to go to the synced position ${synced}.`, p.syncedMs, `startlocal:${p.syncedMs}:${p.localMs}`)
++        } else {
++          this.showPositionNotice(`Started at the synced position ${synced}. Tap to go back to ${local}.`, p.localMs, `start:${p.syncedMs}:${p.localMs}`)
++        }
+       }
+     },
+     showSyncsFailedDialog() {
+@@ -813,9 +857,8 @@ export default {
+           this.showFullscreen = false
+         } else if (action === 'local_position' || action === 'synced_position') {
+           // Release Radar fork: both windows are cached, so either jump is instant
+-          const ms = action === 'local_position' ? this.positions.localMs : this.positions.syncedMs
+-          this.atLocalPosition = action === 'local_position'
+-          this.seek(ms / 1000)
++          if (!this.positions) return
++          this.jumpToPosition(action === 'local_position' ? this.positions.localMs : this.positions.syncedMs)
+         } else if (action === 'scale_elapsed_time') {
+           this.playerSettings.scaleElapsedTimeBySpeed = !this.playerSettings.scaleElapsedTimeBySpeed
+           this.updateTimestamp()
+@@ -927,8 +970,10 @@ export default {
+     // When a playback session is started the native android/ios will send the session
+     onPlaybackSession(playbackSession) {
+       console.log('onPlaybackSession received', JSON.stringify(playbackSession))
++      const prev = this.playbackSession
++      const sameBook = !!(prev && prev.libraryItemId === playbackSession.libraryItemId && (prev.episodeId || null) === (playbackSession.episodeId || null))
+       this.playbackSession = playbackSession
+-      this.loadPositions()
++      this.loadPositions(sameBook)
+ 
+       this.isEnded = false
+       this.isLoading = true
+@@ -970,7 +1015,6 @@ export default {
+       AbsAudioPlayer.addListener('onProgressSyncSuccess', this.showProgressSyncSuccess)
+       AbsAudioPlayer.addListener('onPlaybackSpeedChanged', this.onPlaybackSpeedChanged)
+       AbsAudioPlayer.addListener('onPositions', this.onPositions) // Release Radar fork
+-      this.$eventBus.$on('device-focus-update', this.onDeviceFocus)
+     },
+     async screenOrientationChange() {
+       if (this.isRefreshingUI) return
+diff --git a/components/app/AudioPlayerContainer.vue b/components/app/AudioPlayerContainer.vue
+index f9f8404..3fee53d 100644
+--- a/components/app/AudioPlayerContainer.vue
++++ b/components/app/AudioPlayerContainer.vue
+@@ -420,18 +420,10 @@ export default {
+ 
+         await this.checkSyncServerProgressWithLocalProgress(localMediaProgress)
+       } else {
+-        // server item so fetch server media progress and update player time
+-        console.log('[AudioPlayerContainer] device visibility: checking server media progress for server media item open in player')
+-        const data = await this.getServerMediaProgressForCurrentSession()
+-        if (!data) return
+-        if (!this.$refs.audioPlayer?.isPlaying) {
+-          console.log('[AudioPlayerContainer] device visibility: got server media progress', data.currentTime, 'last time in player is', this.currentTime)
+-          // Only seek if the difference is greater than 1 second
+-          if (Math.abs(data.currentTime - this.currentTime) > 1) {
+-            // Use seek() so the native audio player's current session is updated
+-            this.$refs.audioPlayer.seek(data.currentTime)
+-          }
+-        }
++        // Release Radar fork: the native side asks the server and, when another device moved the book,
++        // continues from there and offers the way back (toast + player menu)
++        console.log('[AudioPlayerContainer] device visibility: native reconcile of the server media progress')
++        await AbsAudioPlayer.reconcileServerProgress().catch(() => null)
+       }
+     }
+   },
+diff --git a/components/cards/LazyBookCard.vue b/components/cards/LazyBookCard.vue
+index 312e052..e8e79f3 100644
+--- a/components/cards/LazyBookCard.vue
++++ b/components/cards/LazyBookCard.vue
+@@ -486,6 +486,16 @@ export default {
+       } else {
+         const router = this.$router || this.$nuxt.$router
+         if (router) {
++          // Release Radar fork: the cached home shelves show before the server has answered; the item page needs
++          // the server, so a tap starts the book instead (the native side resumes it from the phone when it can)
++          if (!this.isPodcast && !this.recentEpisode && !this.collapsedSeries && !String(this.libraryItemId).startsWith('local') && !this.store.state.user.serverConnectionConfig) {
++            if (this.localLibraryItem) return router.push(`/item/${this.localLibraryItemId}`)
++            if (this.playerIsStartingPlayback) return
++            const eventBus = this.$eventBus || this.$nuxt.$eventBus
++            this.store.commit('setPlayerIsStartingPlayback', this.libraryItemId)
++            eventBus.$emit('play-item', { libraryItemId: this.libraryItemId, episodeId: null })
++            return
++          }
+           if (this.recentEpisode) router.push(`/item/${this.libraryItemId}/${this.recentEpisode.id}`)
+           else if (this.collapsedSeries) router.push(`/bookshelf/series/${this.collapsedSeries.id}`)
+           else if (this.localLibraryItem) {
+diff --git a/layouts/default.vue b/layouts/default.vue
+index 113266f..5cc9963 100644
+--- a/layouts/default.vue
++++ b/layouts/default.vue
+@@ -16,7 +16,7 @@
+ 
+ <script>
+ import { CapacitorHttp } from '@capacitor/core'
+-import { AbsLogger, AbsDatabase } from '@/plugins/capacitor'
++import { AbsLogger, AbsDatabase, AbsAudioPlayer } from '@/plugins/capacitor'
+ 
+ export default {
+   data() {
+@@ -266,8 +266,14 @@ export default {
+       // Check if this media item is currently open in the player, paused, and this progress update is coming from a different session
+       const isMediaOpenInPlayer = this.$store.getters['getIsMediaStreaming'](prog.libraryItemId, prog.episodeId)
+       if (isMediaOpenInPlayer && this.$store.getters['getCurrentPlaybackSessionId'] !== payload.sessionId && !this.$store.state.playerIsPlaying) {
+-        await AbsLogger.info({ tag: 'default', message: `userMediaProgressUpdate: Updating paused player playback time to ${payload.data.currentTime} (${itemLabel}, mediaProgressId: ${mediaProgressId})` })
+-        this.$eventBus.$emit('playback-time-update', payload.data.currentTime)
++        if (this.$store.getters['getIsCurrentSessionLocal']) {
++          await AbsLogger.info({ tag: 'default', message: `userMediaProgressUpdate: Updating paused player playback time to ${payload.data.currentTime} (${itemLabel}, mediaProgressId: ${mediaProgressId})` })
++          this.$eventBus.$emit('playback-time-update', payload.data.currentTime)
++        } else {
++          // Release Radar fork: a streamed book goes through the native reconcile, which keeps the way back
++          await AbsLogger.info({ tag: 'default', message: `userMediaProgressUpdate: another session moved the paused book; native reconcile (${itemLabel})` })
++          AbsAudioPlayer.reconcileServerProgress().catch(() => null)
++        }
+       }
+ 
+       // Get local media progress if exists
+diff --git a/pages/bookshelf/index.vue b/pages/bookshelf/index.vue
+index 54534d7..8891fbb 100644
+--- a/pages/bookshelf/index.vue
++++ b/pages/bookshelf/index.vue
+@@ -38,6 +38,7 @@
+ </template>
+ 
+ <script>
++import { AbsLogger } from '@/plugins/capacitor'
+ export default {
+   props: {},
+   data() {
+@@ -238,39 +239,38 @@ export default {
+       // Set local library items first
+       this.localLibraryItems = await this.$db.getLocalLibraryItems()
+       const localCategories = this.getLocalMediaItemCategories()
+-      this.shelves = localCategories
+-      console.log('[categories] Local shelves set', this.shelves.length, this.lastLocalFetch)
++      // Release Radar fork: connected or not, the shelves the server sent last time stay on screen until it answers
++      // (assigned once, so shelves already showing are not cleared while the server is asked)
++      const cachedShown = await this.showCachedCategories(localCategories)
++      if (!cachedShown) {
++        this.shelves = localCategories
++        console.log('[categories] Local shelves set', this.shelves.length, this.lastLocalFetch)
++      }
+ 
+       if (isConnectedToServerWithInternet) {
+-        const categories = await this.$nativeHttp.get(`/api/libraries/${this.currentLibraryId}/personalized?minified=1&include=rssfeed,numEpisodesIncomplete`, { connectTimeout: 10000 }).catch((error) => {
++        const libraryId = this.currentLibraryId // Release Radar fork: the library this request is for
++        const categories = await this.$nativeHttp.get(`/api/libraries/${libraryId}/personalized?minified=1&include=rssfeed,numEpisodesIncomplete`, { connectTimeout: 10000 }).catch((error) => {
+           console.error('[categories] Failed to fetch categories', error)
+           return []
+         })
++        if (this.currentLibraryId !== libraryId) {
++          console.log('[categories] Library changed while fetching, dropping the response')
++          this.isLoading = false
++          return
++        }
+         if (!categories.length) {
+-          // Failed to load categories so use local shelves
++          // Failed to load categories so use local shelves (and the cached server shelves if any)
+           console.warn(`[categories] Failed to get server categories so using local categories`)
+           this.lastServerFetch = 0
+           this.lastLocalFetch = Date.now()
++          await this.showCachedCategories(localCategories)
+           this.isLoading = false
+           console.log('[categories] Local shelves set from failure', this.shelves.length, this.lastLocalFetch)
+           return
+         }
+ 
+-        this.shelves = categories.map((cat) => {
+-          if (cat.type == 'book' || cat.type == 'podcast' || cat.type == 'episode') {
+-            // Map localLibraryItem to entities
+-            cat.entities = cat.entities.map((entity) => {
+-              const localLibraryItem = this.localLibraryItems.find((lli) => {
+-                return lli.libraryItemId == entity.id
+-              })
+-              if (localLibraryItem) {
+-                entity.localLibraryItem = localLibraryItem
+-              }
+-              return entity
+-            })
+-          }
+-          return cat
+-        })
++        this.$localStore.setCachedCategories(libraryId, categories) // Release Radar fork
++        this.shelves = this.mapServerCategories(categories)
+ 
+         // Only add the local shelf with the same media type
+         const localShelves = localCategories.filter((cat) => cat.type === this.currentLibraryMediaType && !cat.localOnly)
+@@ -280,6 +280,40 @@ export default {
+ 
+       this.isLoading = false
+     },
++    mapServerCategories(categories) {
++      return categories.map((cat) => {
++        if (cat.type == 'book' || cat.type == 'podcast' || cat.type == 'episode') {
++          // Map localLibraryItem to entities
++          cat.entities = cat.entities.map((entity) => {
++            const localLibraryItem = this.localLibraryItems.find((lli) => {
++              return lli.libraryItemId == entity.id
++            })
++            if (localLibraryItem) {
++              entity.localLibraryItem = localLibraryItem
++            }
++            return entity
++          })
++        }
++        return cat
++      })
++    },
++    // Release Radar fork: returns true when cached server shelves were put on screen
++    async showCachedCategories(localCategories) {
++      // after a Disconnect or Logout no server is remembered: show the Connect prompt, not an old server's shelves
++      const deviceData = await this.$db.getDeviceData().catch(() => null)
++      if (!deviceData || !deviceData.lastServerConnectionConfigId) return false
++      // the last-library preference is only written when a library is picked by hand; the cache remembers its own
++      const libraryId = this.currentLibraryId || (await this.$localStore.getLastLibraryId()) || (await this.$localStore.getCachedLibraryId())
++      const cached = libraryId ? await this.$localStore.getCachedCategories(libraryId) : null
++      if (!cached || !cached.length) {
++        AbsLogger.info({ tag: 'categories', message: `home: no cached shelves (library ${libraryId || 'unknown'})` })
++        return false
++      }
++      // the offline-only shelves for downloaded books stay first: they work without any server
++      this.shelves = [...localCategories.filter((cat) => cat.localOnly), ...this.mapServerCategories(cached), ...localCategories.filter((cat) => !cat.localOnly)]
++      AbsLogger.info({ tag: 'categories', message: `home: ${cached.length} cached shelves shown for library ${libraryId} before the server answered` })
++      return true
++    },
+     libraryChanged() {
+       if (this.currentLibraryId) {
+         console.log(`[categories] libraryChanged so fetching categories`)
+diff --git a/pages/logs.vue b/pages/logs.vue
+index b5db7b9..818a965 100644
+--- a/pages/logs.vue
++++ b/pages/logs.vue
+@@ -132,7 +132,28 @@ export default {
+       this.hasScrolled = this.$refs.logContainer.scrollTop > 0
+     },
+     maskLogMessage(message) {
+-      return message.replace(/(https?:\/\/)\S+/g, '$1[SERVER_ADDRESS]')
++      let masked = message.replace(/(https?:\/\/)\S+/g, '$1[SERVER_ADDRESS]')
++      // Release Radar fork: the fork's own lines may name a host without a scheme, also while no server is connected
++      const configs = [this.$store.state.user.serverConnectionConfig, ...(this.$store.state.deviceData?.serverConnectionConfigs || [])]
++      const hosts = new Set()
++      configs.forEach((cfg) => {
++        ;[cfg?.address, cfg?.localAddress].filter(Boolean).forEach((a) => {
++          let host = null
++          try {
++            const u = new URL(a)
++            hosts.add(u.host) // host:port
++            hosts.add(u.hostname) // native lines name the host without the port
++          } catch (e) {
++            const h = String(a).replace(/^https?:\/\//, '').split('/')[0]
++            hosts.add(h)
++            hosts.add(h.split(':')[0])
++          }
++        })
++      })
++      ;[...hosts].filter(Boolean).sort((a, b) => b.length - a.length).forEach((host) => {
++        masked = masked.split(host).join('[SERVER_ADDRESS]')
++      })
++      return masked
+     },
+     loadLogs() {
+       this.isLoading = true
+diff --git a/plugins/localStore.js b/plugins/localStore.js
+index 13e2fcd..715df5f 100644
+--- a/plugins/localStore.js
++++ b/plugins/localStore.js
+@@ -151,6 +151,48 @@ class LocalStorage {
+    * @returns {Promise<string>}
+    */
+   async getPreferenceByKey(key) {
++    return this._getPreferenceByKey(key)
++  }
++
++  // Release Radar fork: the home shelves of a library, as the server last sent them
++  async setCachedCategories(libraryId, categories) {
++    try {
++      await Preferences.set({ key: `categories-${libraryId}`, value: JSON.stringify(categories) })
++      await Preferences.set({ key: 'categories-last-library', value: libraryId })
++    } catch (error) {
++      console.error('[LocalStorage] Failed to cache categories', error)
++    }
++  }
++
++  async clearCachedCategories() {
++    try {
++      const { keys } = await Preferences.keys()
++      await Promise.all(keys.filter((key) => key.startsWith('categories-')).map((key) => Preferences.remove({ key })))
++    } catch (error) {
++      console.error('[LocalStorage] Failed to clear cached categories', error)
++    }
++  }
++
++  async getCachedLibraryId() {
++    try {
++      const obj = (await Preferences.get({ key: 'categories-last-library' })) || {}
++      return obj.value || null
++    } catch (error) {
++      return null
++    }
++  }
++
++  async getCachedCategories(libraryId) {
++    try {
++      const obj = (await Preferences.get({ key: `categories-${libraryId}` })) || {}
++      return obj.value ? JSON.parse(obj.value) : null
++    } catch (error) {
++      console.error('[LocalStorage] Failed to get cached categories', error)
++      return null
++    }
++  }
++
++  async _getPreferenceByKey(key) {
+     try {
+       const obj = await Preferences.get({ key }) || {}
+       return obj.value || null
+diff --git a/store/globals.js b/store/globals.js
+index e5e8395..8731871 100644
+--- a/store/globals.js
++++ b/store/globals.js
+@@ -1,3 +1,13 @@
++// Release Radar fork: before /api/authorize answers, the cached home shelves take their covers from the saved config
++const coverServer = (rootState, rootGetters) => {
++  const address = rootGetters['user/getServerRequestAddress']
++  if (address) return { address, token: rootGetters['user/getToken'] }
++  const dd = rootState.deviceData
++  if (rootState.user.serverConnectionConfig || !dd || !dd.lastServerConnectionConfigId) return null
++  const saved = (dd.serverConnectionConfigs || []).find((c) => c.id === dd.lastServerConnectionConfigId)
++  return saved && saved.address ? { address: saved.address, token: saved.token } : null
++}
++
+ export const state = () => ({
+   isModalOpen: false,
+   itemDownloads: [],
+@@ -37,8 +47,9 @@ export const getters = {
+       // Absolute URL covers (should no longer be used)
+       if (media.coverPath.startsWith('http:') || media.coverPath.startsWith('https:')) return media.coverPath
+ 
+-      const serverAddress = rootGetters['user/getServerRequestAddress'] // Release Radar fork
+-      if (!serverAddress) return placeholder
++      const server = coverServer(rootState, rootGetters) // Release Radar fork: cached shelves before the server answers
++      if (!server) return placeholder
++      const serverAddress = server.address
+ 
+       const lastUpdate = libraryItem.updatedAt || Date.now()
+ 
+@@ -52,7 +63,7 @@ export const getters = {
+       urlQuery.append('ts', lastUpdate)
+       if (raw) urlQuery.append('raw', '1')
+       if (rootGetters.getDoesServerImagesRequireToken) {
+-        urlQuery.append('token', rootGetters['user/getToken'])
++        urlQuery.append('token', server.token)
+       }
+       return `${url}?${urlQuery}`
+     },
+@@ -61,12 +72,13 @@ export const getters = {
+     (libraryItemId, placeholder = null) => {
+       if (!placeholder) placeholder = `${rootState.routerBasePath}/book_placeholder.jpg`
+       if (!libraryItemId) return placeholder
+-      const serverAddress = rootGetters['user/getServerRequestAddress'] // Release Radar fork
+-      if (!serverAddress) return placeholder
++      const server = coverServer(rootState, rootGetters) // Release Radar fork
++      if (!server) return placeholder
++      const serverAddress = server.address
+ 
+       const url = new URL(`${serverAddress}/api/items/${libraryItemId}/cover`)
+       if (rootGetters.getDoesServerImagesRequireToken) {
+-        return `${url}?token=${rootGetters['user/getToken']}`
++        return `${url}?token=${server.token}`
+       }
+       return url.toString()
+     },
+diff --git a/store/user.js b/store/user.js
+index 3c63d32..f744242 100644
+--- a/store/user.js
++++ b/store/user.js
+@@ -168,6 +168,7 @@ export const actions = {
+     await this.$db.logout()
+     this.$socket.logout()
+     this.$localStore.removeLastLibraryId()
++    await this.$localStore.clearCachedCategories() // Release Radar fork: the home cache belongs to that server
+     commit('logout')
+     commit('libraries/setCurrentLibrary', null, { root: true })
+     await AbsLogger.info({ tag: 'user', message: `Logged out from server ${state.serverConnectionConfig?.name || 'Not connected'}` })
+-- 
+2.45.2.windows.1
+

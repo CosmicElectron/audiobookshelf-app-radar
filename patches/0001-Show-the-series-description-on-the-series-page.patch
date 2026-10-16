@@ -1,7 +1,7 @@
 From 6e89d2978da814a7ab84c7e3cf306735b2958431 Mon Sep 17 00:00:00 2001
 From: Release Radar <release-radar@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 17:05:06 +0800
-Subject: [PATCH 1/4] Show the series description on the series page
+Subject: [PATCH 1/5] Show the series description on the series page
 
 Audiobookshelf stores a per-series description (PATCH /api/series/:id) that
 no client displays. Render it as one small line above the shelf on the

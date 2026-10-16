@@ -1,7 +1,7 @@
 From 7a3365d814b1e3fe1bd06f61c35f40891e814d50 Mon Sep 17 00:00:00 2001
 From: Release Radar <release-radar@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 15:05:51 +0800
-Subject: [PATCH 2/4] Faster streaming over a tunnel; listening sessions in the
+Subject: [PATCH 2/5] Faster streaming over a tunnel; listening sessions in the
  player
 
 - ExoPlayer keeps 60s of audio behind the playhead (back buffer) so the
